@@ -1,0 +1,748 @@
+import type {
+  Release,
+  Edition,
+  EditionFormat,
+  Chapter,
+  Series,
+  ChapterHighlight,
+} from '@/lib/releases-types'
+import type { Character, NewsPost, Place, UserProfile } from '@/lib/types'
+import type { SeriesRelease } from '@/lib/server/series'
+import type { EditionMeta } from '@/lib/utils/editions'
+import { stripHtml, truncate } from '@/lib/seo/metadata'
+import {
+  BASE_URL,
+  absoluteUrl,
+  ID,
+  ref,
+  imageObject,
+  editionUrl,
+  editionSchemaType,
+  isAudioSchemaType,
+  toISO8601Duration,
+  toISODate,
+  organizationNode,
+  websiteNode,
+  QUALITY_TIER_EDITION_LABELS,
+} from '@/lib/seo/entities'
+
+export { serializeJsonLd } from '@/lib/seo/serialize'
+export { organizationNode, authorNode, websiteNode, BASE_URL, absoluteUrl, ID } from '@/lib/seo/entities'
+
+// === Общее ===
+
+export function generateBreadcrumbSchema(items: Array<{ label: string; url: string }>) {
+  return {
+    '@type': 'BreadcrumbList',
+    itemListElement: items.map((item, index) => ({
+      '@type': 'ListItem',
+      position: index + 1,
+      name: item.label,
+      item: item.url,
+    })),
+  }
+}
+
+export interface CollectionItem {
+  name: string
+  url: string
+  image?: string | null
+}
+
+/**
+ * `CollectionPage` + `ItemList` для каталогов. Без него листинги выглядят для
+ * поисковика как страницы без структуры — связь с карточками не читается.
+ */
+export function generateCollectionSchema(opts: {
+  name: string
+  description: string
+  path: string
+  items: CollectionItem[]
+  /** Общее число элементов, если на странице показана только часть. */
+  totalItems?: number
+}) {
+  const url = absoluteUrl(opts.path)
+
+  return {
+    '@type': 'CollectionPage',
+    '@id': url,
+    name: opts.name,
+    description: truncate(stripHtml(opts.description)),
+    url,
+    inLanguage: 'ru-RU',
+    isPartOf: ref(ID.website),
+    publisher: ref(ID.organization),
+    mainEntity: {
+      '@type': 'ItemList',
+      numberOfItems: opts.totalItems ?? opts.items.length,
+      itemListElement: opts.items.map((item, index) => ({
+        '@type': 'ListItem',
+        position: index + 1,
+        name: item.name,
+        url: item.url,
+        ...(item.image && { image: item.image }),
+      })),
+    },
+  }
+}
+
+// === Релиз (произведение) ===
+
+/**
+ * Авторы из БД, с откатом на канонического автора вселенной.
+ *
+ * Раньше `author` был захардкожен всегда — `releases.authors` игнорировался,
+ * поэтому соавторы в разметку не попадали.
+ */
+function releaseAuthors(release: Release) {
+  if (!release.authors || release.authors.length === 0) return ref(ID.author)
+
+  const authors = release.authors
+    .filter(author => author?.name)
+    .map(author => ({
+      '@type': 'Person',
+      name: author.name,
+      ...(author.role && { jobTitle: author.role }),
+    }))
+
+  return authors.length > 0 ? authors : ref(ID.author)
+}
+
+/**
+ * Одно медиавоплощение внутри `hasPart` релиза.
+ *
+ * Тип берётся из карты форматов, а не фиксируется как `Book`: комиксы,
+ * аудиокниги, журналы и альбомы иначе не размечались вообще.
+ */
+function editionExample(
+  edition: Edition,
+  release: Release,
+  meta?: EditionMeta,
+): Record<string, unknown> {
+  const spec = editionSchemaType(edition.format)
+  const url = editionUrl(edition.slug || edition.id)
+  const tierLabel = QUALITY_TIER_EDITION_LABELS[edition.quality_tier]
+  const isAudio = isAudioSchemaType(spec.type)
+
+  return {
+    '@type': spec.type,
+    '@id': ID.edition(edition.slug || edition.id),
+    name: tierLabel ? `${release.title} — ${tierLabel.toLowerCase()}` : release.title,
+    url,
+    inLanguage: 'ru-RU',
+    isAccessibleForFree: true,
+    ...(spec.bookFormat && { bookFormat: spec.bookFormat }),
+    ...(edition.format === 'book' && tierLabel && { bookEdition: tierLabel }),
+    // isbn — свойство Book, не CreativeWork: на произведении он был невалиден.
+    ...(edition.format === 'book' && release.isbn && { isbn: release.isbn }),
+    ...(edition.external_url && { sameAs: edition.external_url }),
+    ...(meta && !isAudio && meta.wordCount > 0 && { wordCount: meta.wordCount }),
+    ...(meta &&
+      !isAudio &&
+      meta.readingMinutes > 0 && { timeRequired: `PT${meta.readingMinutes}M` }),
+    ...(meta &&
+      isAudio && { duration: toISO8601Duration(meta.durationSeconds) }),
+    author: releaseAuthors(release),
+    publisher: ref(ID.organization),
+    potentialAction: {
+      '@type': isAudio ? 'ListenAction' : edition.format === 'artwork' ? 'ViewAction' : 'ReadAction',
+      target: { '@type': 'EntryPoint', urlTemplate: url },
+    },
+  }
+}
+
+function releaseGenres(formats: EditionFormat[], genre: string | null): string[] {
+  const genres: string[] = ['Fiction', 'Contemporary Fiction']
+  if (formats.includes('comic')) genres.push('Comics & Graphic Novels')
+  if (genre && !genres.includes(genre)) genres.push(genre)
+  return genres
+}
+
+/**
+ * Релиз остаётся `CreativeWork` — общей творческой идентичностью.
+ * Конкретные типы (`Book`, `ComicIssue`, `Audiobook`, …) живут в `hasPart`
+ * и на собственных страницах изданий.
+ *
+ * Связи с персонажами:
+ * - `character` — ВСЕ привязанные (главные и второстепенные), как массив @id-ссылок;
+ * - `about` — главный герой (`role = 'main'`), как полная @id-ссылка.
+ * Без разделения поисковик не понимает, кто ведёт сюжет, а кто эпизодичен.
+ *
+ * Связи с местами:
+ * - `contentLocation` — локации, где происходит действие (через release_places).
+ */
+export function generateReleaseSchema(opts: {
+  release: Release
+  editions: Edition[]
+  formats: EditionFormat[]
+  characters?: Array<Pick<Character, 'name' | 'slug' | 'avatar'>>
+  /** Роли каждого персонажа в релизе (`main`/`supporting`/`cameo`). */
+  characterRoles?: Map<string, string>
+  places?: Array<Pick<Place, 'name' | 'slug'>>
+  series?: { slug: string; title: string } | null
+  /** Агрегаты основного издания — страницы, слова, длительность. */
+  primaryMeta?: EditionMeta
+  primaryEditionId?: string | null
+}) {
+  const { release, editions, formats, characters, characterRoles, places, series, primaryMeta, primaryEditionId } = opts
+  const url = `${BASE_URL}/release/${release.slug}`
+
+  const published = editions.filter(edition => edition.status === 'published')
+  const parts = published.map(edition =>
+    editionExample(
+      edition,
+      release,
+      primaryEditionId && edition.id === primaryEditionId ? primaryMeta : undefined,
+    ),
+  )
+
+  // Сборка character/about из единого списка. role хранится в Map,
+  // чтобы не менять сигнатуру characterNode.
+  const persons: Array<Record<string, unknown>> = []
+
+  if (characters && characters.length > 0) {
+    for (const character of characters) {
+      const node: Record<string, unknown> = {
+        '@type': 'Person',
+        '@id': ID.character(character.slug),
+        name: character.name,
+        url: `${BASE_URL}/characters/${character.slug}`,
+        image: imageObject(character.avatar),
+      }
+      persons.push(node)
+    }
+  }
+
+  const protagonist =
+    characters && characterRoles
+      ? characters.find(
+          character => characterRoles.get(character.slug) === 'main',
+        ) ?? null
+      : null
+
+  const protagonistNode = protagonist
+    ? {
+        '@type': 'Person',
+        '@id': ID.character(protagonist.slug),
+        name: protagonist.name,
+        url: `${BASE_URL}/characters/${protagonist.slug}`,
+      }
+    : null
+
+  // contentLocation — локации из release_places
+  const contentLocation = places
+    ?.filter(p => p?.slug)
+    .map(p => ({
+      '@type': 'Place',
+      '@id': ID.place(p.slug),
+      name: p.name,
+      url: `${BASE_URL}/places/${p.slug}`,
+    }))
+
+  return {
+    '@type': 'CreativeWork',
+    '@id': ID.work(release.slug),
+    name: release.title,
+    description: truncate(
+      stripHtml(release.annotation ?? release.description) || `«${release.title}» на canfly`,
+      300,
+    ),
+    image: imageObject(release.cover_image),
+    url,
+    mainEntityOfPage: { '@type': 'WebPage', '@id': url },
+    datePublished: toISODate(release.release_date ?? release.created_at),
+    dateModified: toISODate(release.updated_at),
+    author: releaseAuthors(release),
+    publisher: ref(ID.organization),
+    genre: releaseGenres(formats, release.genre),
+    inLanguage: 'ru-RU',
+    isAccessibleForFree: true,
+    ...(series && { isPartOf: ref(ID.series(series.slug)) }),
+    ...(persons.length > 0 && { character: persons }),
+    ...(protagonistNode && { about: protagonistNode }),
+    ...(contentLocation && contentLocation.length > 0 && { contentLocation }),
+    ...(parts.length > 0 && { hasPart: parts }),
+    ...(release.view_count > 0 && {
+      interactionStatistic: {
+        '@type': 'InteractionCounter',
+        interactionType: 'https://schema.org/ReadAction',
+        userInteractionCount: release.view_count,
+      },
+    }),
+  }
+}
+
+// === Издание (страница читалки /vvvvv) ===
+
+/**
+ * Конкретное издание с главами. Тип зависит от формата, поэтому одна и та же
+ * функция отдаёт `Book` для книги и `ComicIssue` для комикса.
+ */
+export function generateEditionSchema(opts: {
+  edition: Edition
+  release: Release
+  chapters: Array<Pick<Chapter, 'id' | 'title' | 'chapter_index' | 'duration_seconds'>>
+  meta: EditionMeta
+  series?: { slug: string; title: string } | null
+}) {
+  const { edition, release, chapters, meta, series } = opts
+  const spec = editionSchemaType(edition.format)
+  const editionSlug = edition.slug || edition.id
+  const url = editionUrl(editionSlug)
+  const isAudio = isAudioSchemaType(spec.type)
+  const tierLabel = QUALITY_TIER_EDITION_LABELS[edition.quality_tier]
+
+  // У глав нет собственных индексируемых адресов, поэтому части описываются
+  // именем и позицией, без ссылок в никуда.
+  const hasPart = chapters.map(chapter => ({
+    '@type': isAudio ? 'AudioObject' : 'Chapter',
+    name: chapter.title,
+    position: chapter.chapter_index + 1,
+    ...(isAudio && { duration: toISO8601Duration(chapter.duration_seconds ?? 0) }),
+  }))
+
+  return {
+    '@type': spec.type,
+    '@id': ID.edition(editionSlug),
+    name: tierLabel ? `${release.title} — ${tierLabel.toLowerCase()}` : release.title,
+    description: truncate(
+      stripHtml(release.annotation ?? release.description) || `«${release.title}» на canfly`,
+      300,
+    ),
+    image: imageObject(edition.artwork_url ?? release.cover_image),
+    url,
+    mainEntityOfPage: { '@type': 'WebPage', '@id': url },
+    inLanguage: 'ru-RU',
+    isAccessibleForFree: true,
+    datePublished: toISODate(release.release_date ?? edition.created_at),
+    dateModified: toISODate(edition.updated_at),
+    author: releaseAuthors(release),
+    publisher: ref(ID.organization),
+    // Издание — воплощение произведения: связь обязательна, иначе страницы
+    // релиза и читалки выглядят как два независимых объекта.
+    exampleOfWork: ref(ID.work(release.slug)),
+    ...(spec.bookFormat && { bookFormat: spec.bookFormat }),
+    ...(edition.format === 'book' && tierLabel && { bookEdition: tierLabel }),
+    ...(edition.format === 'book' && release.isbn && { isbn: release.isbn }),
+    ...(series &&
+      spec.seriesType && {
+        isPartOf: {
+          '@type': spec.seriesType,
+          '@id': ID.series(series.slug),
+          name: series.title,
+          url: `${BASE_URL}/series/${series.slug}`,
+        },
+      }),
+    ...(meta.chapterCount > 0 && { numberOfPages: meta.chapterCount }),
+    ...(!isAudio && meta.wordCount > 0 && { wordCount: meta.wordCount }),
+    ...(!isAudio &&
+      meta.readingMinutes > 0 && { timeRequired: `PT${meta.readingMinutes}M` }),
+    ...(isAudio && { duration: toISO8601Duration(meta.durationSeconds) }),
+    ...(hasPart.length > 0 && { hasPart }),
+    potentialAction: {
+      '@type': isAudio ? 'ListenAction' : edition.format === 'artwork' ? 'ViewAction' : 'ReadAction',
+      target: { '@type': 'EntryPoint', urlTemplate: url },
+    },
+  }
+}
+
+// === Серия ===
+
+export function generateSeriesSchema(series: Series, releases: SeriesRelease[]) {
+  const url = `${BASE_URL}/series/${series.slug}`
+
+  return {
+    '@type': 'CreativeWorkSeries',
+    '@id': ID.series(series.slug),
+    name: series.title,
+    description: truncate(
+      stripHtml(series.description) || `Серия «${series.title}» на canfly`,
+      300,
+    ),
+    url,
+    mainEntityOfPage: { '@type': 'WebPage', '@id': url },
+    inLanguage: 'ru-RU',
+    author: ref(ID.author),
+    publisher: ref(ID.organization),
+    hasPart: releases.map(release => ({
+      '@type': 'CreativeWork',
+      '@id': ID.work(release.slug),
+      name: release.title,
+      url: `${BASE_URL}/release/${release.slug}`,
+      ...(release.phase_number != null && { position: release.phase_number }),
+      ...(release.cover_image && { image: release.cover_image }),
+      datePublished: toISODate(release.release_date),
+    })),
+  }
+}
+
+// === Персонажи и профили ===
+
+type CharacterSeed = Pick<Character, 'name' | 'slug' | 'avatar'> &
+  Partial<Pick<Character, 'bio' | 'full_description' | 'updated_at'>>
+
+/**
+ * Минимальный набор произведений, в которых персонаж участвует, для subjectOf.
+ *
+ * Это «ссылочные» узлы — только @id, имя и опциональный тип. Полные
+ * описания лежат на странице самого релиза, дублировать их здесь — лишний
+ * шум в графе и риск рассинхронизации.
+ */
+export interface CharacterSubjectRef {
+  /** Slug релиза или серии — для сборки @id. */
+  slug: string
+  /** Название для подписи под @id в JSON-LD. */
+  name: string
+  /** 'CreativeWork' (по умолчанию), 'CreativeWorkSeries', 'Book'. */
+  type?: 'CreativeWork' | 'CreativeWorkSeries' | 'Book'
+}
+
+/**
+ * Узел персонажа в графе.
+ *
+ * `opts.subjectOf` — список ссылок на произведения/серии, где персонаж
+ * значится (subjectOf на странице профиля). `opts.full: true` отдаёт полный
+ * Person с описанием, иначе — краткий ref для вкраплений в `character`/`about`.
+ */
+export function characterNode(
+  character: CharacterSeed,
+  opts: { full: boolean; subjectOf?: CharacterSubjectRef[]; location?: Array<{ slug: string; name: string }> },
+) {
+  const url = `${BASE_URL}/characters/${character.slug}`
+
+  const base = {
+    '@type': 'Person' as const,
+    '@id': ID.character(character.slug),
+    name: character.name,
+    url,
+    image: imageObject(character.avatar),
+  }
+
+  if (!opts.full) return base
+
+  const bio = stripHtml(character.bio ?? character.full_description)
+  const subjectOf = opts.subjectOf
+    ?.filter(s => s?.slug)
+    .map(s => {
+      const node: Record<string, unknown> = {
+        '@type': s.type ?? 'CreativeWork',
+        '@id':
+          s.type === 'CreativeWorkSeries'
+            ? ID.series(s.slug)
+            : ID.work(s.slug),
+        name: s.name,
+      }
+      if (s.type === 'CreativeWorkSeries') {
+        node.url = `${BASE_URL}/series/${s.slug}`
+      } else {
+        node.url = `${BASE_URL}/release/${s.slug}`
+      }
+      return node
+    })
+
+  const location = opts.location
+    ?.filter(l => l?.slug)
+    .map(l => ({
+      '@type': 'Place' as const,
+      '@id': ID.place(l.slug),
+      name: l.name,
+      url: `${BASE_URL}/places/${l.slug}`,
+    }))
+
+  return {
+    ...base,
+    description: truncate(
+      bio
+        ? `${bio} — персонаж литературной вселенной canfly.`
+        : 'Персонаж литературной вселенной canfly.',
+      300,
+    ),
+    mainEntityOfPage: { '@type': 'WebPage', '@id': url },
+    ...(subjectOf && subjectOf.length > 0 && { subjectOf }),
+    ...(location && location.length > 0 && { location }),
+  }
+}
+
+/**
+ * JSON-LD профиля персонажа.
+ *
+ * `subjectOf` собирается на стороне вызова (там доступны данные о релизах):
+ * достаточно передать список `{ slug, name, type? }`. Без них узел останется
+ * с минимумом полей и не сломает разметку.
+ */
+export function generateCharacterSchema(
+  character: CharacterSeed,
+  opts: { subjectOf?: CharacterSubjectRef[]; location?: Array<{ slug: string; name: string }>; jobTitle?: string; worksFor?: string } = {},
+) {
+  const url = `${BASE_URL}/characters/${character.slug}`
+  /*
+   * dateModified — единственный сигнал свежести у профиля: записи, связи и
+   * описание меняются без смены URL, а без даты страница выглядит статичной.
+   */
+  const dateModified = toISODate(character.updated_at)
+
+  return {
+    '@type': 'ProfilePage',
+    '@id': url,
+    url,
+    inLanguage: 'ru-RU',
+    isPartOf: ref(ID.website),
+    ...(dateModified && { dateModified }),
+    mainEntity: {
+      ...characterNode(character, { full: true, subjectOf: opts.subjectOf, location: opts.location }),
+      // Поля Person: jobTitle/worksFor — стандартные для schema.org/Person.
+      // Заголовок и место работы задаются через Bio (character.bio) — структурированных
+      // полей в БД нет, поэтому их пробрасывает вызывающая сторона, если знает.
+      ...(opts.jobTitle && { jobTitle: opts.jobTitle }),
+      ...(opts.worksFor && { worksFor: { '@type': 'Organization', name: opts.worksFor } }),
+    },
+  }
+}
+
+/**
+ * JSON-LD страницы места (локация литературной вселенной).
+ *
+ * Place — отдельная сущность, НЕ Person, НЕ ProfilePage.
+ * Собирает жителей (resident) и релизы (subjectOf) для замыкания графа.
+ */
+export function generatePlaceSchema(
+  place: Pick<Place, 'name' | 'slug' | 'avatar' | 'bio' | 'full_description'>,
+  opts: {
+    residents?: Array<{ slug: string; name: string; avatar?: string | null }>
+    subjectOf?: CharacterSubjectRef[]
+  } = {},
+) {
+  const url = `${BASE_URL}/places/${place.slug}`
+  const bio = stripHtml(place.bio ?? place.full_description)
+
+  const resident = opts.residents
+    ?.filter(r => r?.slug)
+    .map(r => ({
+      '@type': 'Person',
+      '@id': ID.character(r.slug),
+      name: r.name,
+      url: `${BASE_URL}/characters/${r.slug}`,
+      image: imageObject(r.avatar),
+    }))
+
+  const subjectOf = opts.subjectOf
+    ?.filter(s => s?.slug)
+    .map(s => {
+      const node: Record<string, unknown> = {
+        '@type': s.type ?? 'CreativeWork',
+        '@id':
+          s.type === 'CreativeWorkSeries'
+            ? ID.series(s.slug)
+            : ID.work(s.slug),
+        name: s.name,
+      }
+      if (s.type === 'CreativeWorkSeries') {
+        node.url = `${BASE_URL}/series/${s.slug}`
+      } else {
+        node.url = `${BASE_URL}/release/${s.slug}`
+      }
+      return node
+    })
+
+  return {
+    '@type': 'ProfilePage',
+    '@id': url,
+    url,
+    inLanguage: 'ru-RU',
+    isPartOf: ref(ID.website),
+    mainEntity: {
+      '@type': 'Place',
+      '@id': ID.place(place.slug),
+      name: place.name,
+      url,
+      image: imageObject(place.avatar),
+      description: truncate(
+        bio
+          ? `${bio} — место литературной вселенной canfly.`
+          : 'Место литературной вселенной canfly.',
+        300,
+      ),
+      mainEntityOfPage: { '@type': 'WebPage', '@id': url },
+      ...(resident && resident.length > 0 && { resident }),
+      ...(subjectOf && subjectOf.length > 0 && { subjectOf }),
+    },
+  }
+}
+
+/**
+ * Профиль читателя. `ProfilePage` — тип, который Google ввёл специально для
+ * UGC-страниц; без него публичный профиль читается как обычный текст.
+ */
+export function generateProfilePageSchema(
+  user: Pick<UserProfile, 'handle' | 'display_name' | 'avatar' | 'bio' | 'tagline' | 'created_at'>,
+  stats?: { quotes?: number },
+  socialLinks?: Array<{ url: string }>,
+) {
+  const url = `${BASE_URL}/user/${user.handle}`
+  const bio = stripHtml(user.tagline ?? user.bio)
+
+  return {
+    '@type': 'ProfilePage',
+    '@id': url,
+    url,
+    inLanguage: 'ru-RU',
+    isPartOf: ref(ID.website),
+    dateCreated: toISODate(user.created_at),
+    mainEntity: {
+      '@type': 'Person',
+      '@id': ID.user(user.handle),
+      name: user.display_name,
+      alternateName: `@${user.handle}`,
+      url,
+      image: imageObject(user.avatar),
+      ...(bio && { description: truncate(bio, 300) }),
+      ...(socialLinks && socialLinks.length > 0 && { sameAs: socialLinks.map(link => link.url) }),
+      ...(stats?.quotes != null &&
+        stats.quotes > 0 && {
+          interactionStatistic: {
+            '@type': 'InteractionCounter',
+            interactionType: 'https://schema.org/CreateAction',
+            userInteractionCount: stats.quotes,
+          },
+        }),
+    },
+  }
+}
+
+type AuthorWorkRef = Pick<
+  Release,
+  'slug' | 'title' | 'cover_image' | 'release_date'
+> & { formats?: EditionFormat[] }
+
+/**
+ * Страница автора: `ProfilePage` + Person, который «владеет» своими работами.
+ * Произведения — ссылочные узлы (только @id, имя и дата), полная разметка
+ * лежит на страницах самих релизов. Book ставится, только если основное
+ * издание — книга: для комикса/аудио остаётся абстрактный CreativeWork.
+ */
+export function generateAuthorProfileSchema(
+  user: Pick<UserProfile, 'handle' | 'display_name' | 'avatar' | 'bio' | 'tagline' | 'created_at'>,
+  works: AuthorWorkRef[],
+  socialLinks?: Array<{ url: string }>,
+) {
+  const base = generateProfilePageSchema(user, undefined, socialLinks)
+
+  const hasPart = works.map(work => {
+    const isBook = work.formats?.includes('book')
+    return {
+      '@type': isBook ? 'Book' : 'CreativeWork',
+      '@id': ID.work(work.slug),
+      name: work.title,
+      url: `${BASE_URL}/release/${work.slug}`,
+      ...(work.cover_image && { image: work.cover_image }),
+      ...(work.release_date && { datePublished: toISODate(work.release_date) }),
+      author: ref(ID.user(user.handle)),
+    }
+  })
+
+  return {
+    ...base,
+    ...(hasPart.length > 0 && { hasPart }),
+  }
+}
+
+// === Цитаты ===
+
+export function generateQuotationSchema(opts: {
+  highlight: ChapterHighlight
+  release: Release
+  chapter: Pick<Chapter, 'title'>
+}) {
+  const { highlight, release, chapter } = opts
+  const url = `${BASE_URL}/highlight/${highlight.id}`
+
+  return {
+    '@type': 'Quotation',
+    '@id': ID.quotation(highlight.id),
+    text: highlight.text_content,
+    url,
+    inLanguage: 'ru-RU',
+    mainEntityOfPage: { '@type': 'WebPage', '@id': url },
+    datePublished: toISODate(highlight.created_at),
+    // Цитата принадлежит произведению, а выделил её читатель — это разные роли.
+    isPartOf: ref(ID.work(release.slug)),
+    citation: {
+      '@type': 'CreativeWork',
+      '@id': ID.work(release.slug),
+      name: release.title,
+      url: `${BASE_URL}/release/${release.slug}`,
+      ...(chapter.title && { alternativeHeadline: chapter.title }),
+    },
+    ...(highlight.user_name && {
+      creator: { '@type': 'Person', name: highlight.user_name },
+    }),
+    ...(highlight.likes_count > 0 && {
+      interactionStatistic: {
+        '@type': 'InteractionCounter',
+        interactionType: 'https://schema.org/LikeAction',
+        userInteractionCount: highlight.likes_count,
+      },
+    }),
+  }
+}
+
+// === Новости ===
+
+/**
+ * Тип оставлен `Article`, а не `NewsArticle`: `section` здесь произвольный
+ * («dispatch», заметки, маршруты), а `NewsArticle` Google ожидает у настоящих
+ * новостных изданий.
+ */
+export function generateNewsArticleSchema(post: NewsPost, authorName?: string | null) {
+  const url = `${BASE_URL}/news/${post.slug}`
+  const body = stripHtml(post.content)
+
+  return {
+    '@type': 'Article',
+    '@id': url,
+    headline: truncate(post.title, 110),
+    description: truncate(body || post.title),
+    url,
+    image: imageObject(post.cover_image),
+    datePublished: toISODate(post.published_at ?? post.created_at),
+    dateModified: toISODate(post.updated_at ?? post.published_at ?? post.created_at),
+    author: authorName ? { '@type': 'Person', name: authorName } : ref(ID.author),
+    publisher: ref(ID.organization),
+    mainEntityOfPage: { '@type': 'WebPage', '@id': url },
+    isPartOf: ref(ID.website),
+    inLanguage: 'ru-RU',
+    articleSection: post.section,
+    ...(post.tag && { keywords: post.tag }),
+    ...(body && { wordCount: body.split(/\s+/).length }),
+  }
+}
+
+// === Простая страница ===
+
+export function generateWebPageSchema(opts: {
+  name: string
+  description: string
+  path: string
+}) {
+  const url = absoluteUrl(opts.path)
+
+  return {
+    '@type': 'WebPage',
+    '@id': url,
+    name: opts.name,
+    description: truncate(stripHtml(opts.description)),
+    url,
+    inLanguage: 'ru-RU',
+    isPartOf: ref(ID.website),
+    publisher: ref(ID.organization),
+  }
+}
+
+/** Совместимость: полный узел WebSite отдаётся из layout через `websiteNode()`. */
+export function generateWebSiteSchema() {
+  return websiteNode()
+}
+
+export function generateOrganizationSchema() {
+  return organizationNode()
+}

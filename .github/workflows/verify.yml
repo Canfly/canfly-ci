@@ -1,0 +1,14 @@
+name: Verify GitHub Actions availability
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test runner availability
+        run: |
+          echo Runner started
+          test "$RUNNER_OS" = Linux

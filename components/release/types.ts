@@ -1,0 +1,50 @@
+import type { ChapterHighlight, Edition, Game, Release, Series } from '@/lib/releases-types'
+import type { Place } from '@/lib/types'
+
+export type ReleaseMeta = {
+  chapterCount: number
+  wordCount: number
+  readingMinutes: number
+  durationSeconds: number
+}
+
+export type ReleaseCharacter = {
+  id: string
+  name: string
+  slug: string
+  avatar: string | null
+  bio: string | null
+  canChat: boolean
+  role: string
+}
+
+export type OtherSeriesRelease = {
+  id: string
+  title: string
+  slug: string
+  annotation: string | null
+  cover_image: string | null
+  release_date: string | null
+  phase_number: number | null
+}
+
+export type ReleasePagePublicProps = {
+  release: Release
+  editions: Edition[]
+  primaryEditionSlug: string | null
+  seriesLink: { series: Series; phase_number: number | null } | null
+  highlights: ChapterHighlight[]
+  meta: ReleaseMeta
+  characters: ReleaseCharacter[]
+  games: Game[]
+  places: Array<Pick<Place, 'id' | 'name' | 'slug' | 'bio'> & { role: string }>
+  otherSeriesReleases: OtherSeriesRelease[]
+  /**
+   * Режим предпросмотра для непубличных релизов. `null` — обычная публикация.
+   * `'draft'` — релиз в черновике: показываем бейдж и скрываем из выдачи по
+   * канонам SEO (метаданные уже с `noindex`).
+   */
+  preview?: 'draft' | null
+  /** Есть ли у текущего зрителя право открыть этот релиз в Studio. */
+  viewerCanEdit?: boolean
+}

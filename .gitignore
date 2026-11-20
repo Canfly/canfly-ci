@@ -1,0 +1,49 @@
+.claude/
+.claudeignore
+.playwright-mcp/
+# v0 sandbox internal files
+__v0_runtime_loader.js
+__v0_devtools.tsx
+__v0_jsx-dev-runtime.ts
+.snowflake/
+.v0-trash/
+.vercel/
+next.user-config.*
+*.log
+# Environment variables
+.env*.local
+.agents/
+skills-*.json
+opencode.json
+
+# Common ignores
+node_modules
+.next/
+.DS_Store
+tsconfig.tsbuildinfo
+
+# Playwright
+playwright-report/
+test-results/
+playwright/.cache/
+e2e/.test-credentials.json
+
+!.agents/
+!.agents/skills/
+!.agents/skills/*/
+!.agents/skills/canfly-architecture/SKILL.md
+!.agents/skills/canfly-data-access/SKILL.md
+!.agents/skills/canfly-e2e/SKILL.md
+!.agents/skills/canfly-guardrails/SKILL.md
+!.agents/skills/next-dev-loop/SKILL.md
+
+# AI stop
+.cursor/
+.kiro/
+.vercel
+.env*
+public/gorodN.txt
+public/sonya.txt
+# CocoIndex Code (ccc)
+/.cocoindex_code/
+trash/

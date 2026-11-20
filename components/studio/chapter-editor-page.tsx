@@ -1,0 +1,405 @@
+'use client'
+
+import { useState, useRef, useCallback, type ReactNode } from 'react'
+import { useRouter, unstable_rethrow } from 'next/navigation'
+import { useAutosave } from '@/lib/studio/use-autosave'
+import Link from 'next/link'
+import { toast } from 'sonner'
+import type { Editor } from '@tiptap/react'
+import type { Chapter, ChapterEditorialNote, EditionFormat } from '@/lib/releases-types'
+import { publishChapterAction, deleteChapterAction, updateChapterAction } from '@/lib/actions/studio'
+import { TelegraphEditor } from '@/components/studio/telegraph-editor'
+import { AudioChapterEditor } from '@/components/studio/audio-chapter-editor'
+import { ComicPagesEditor } from '@/components/studio/comic-pages-editor'
+import { VersionHistory } from '@/components/studio/version-history'
+import { EditorialNotesPanel } from '@/components/studio/editorial-notes-panel'
+import { EditorialNotesOverlay } from '@/components/studio/editorial-notes-overlay'
+import { collectParagraphs } from '@/lib/studio/paragraphs'
+import { editorialStatusStyle } from '@/lib/studio/editorial-status'
+import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog'
+import { ArrowLeft, ChevronLeft, ChevronRight, Globe, Trash2, Check, Loader2, AlertCircle, Code2 } from 'lucide-react'
+
+const audioFormats = new Set<EditionFormat>(['audiobook', 'audiorelease', 'album'])
+
+type ChapterNavTarget = { id: string; title: string }
+
+/** Стрелка «предыдущая/следующая глава»: без соседа кнопка остаётся, но неактивна. */
+function ChapterNavButton({
+  target,
+  editionId,
+  label,
+  children,
+}: {
+  target: ChapterNavTarget | null
+  editionId: string
+  label: string
+  children: ReactNode
+}) {
+  if (!target) {
+    return (
+      <Button variant="ghost" size="icon-sm" disabled aria-label={label} title={label} className="rounded-xl text-cf-text-4 disabled:opacity-40">
+        {children}
+      </Button>
+    )
+  }
+
+  const title = `${label}: ${target.title}`
+  return (
+    <Button asChild variant="ghost" size="icon-sm" className="rounded-xl text-cf-text-3 hover:text-cf-accent hover:bg-cf-accent/10">
+      <Link href={`/studio/editions/${editionId}/chapters/${target.id}`} aria-label={title} title={title}>
+        {children}
+      </Link>
+    </Button>
+  )
+}
+
+function parseComicPages(content: string | null): string[] {
+  if (!content) return []
+  try {
+    const parsed = JSON.parse(content)
+    if (Array.isArray(parsed)) return parsed.filter(Boolean)
+  } catch {}
+  return []
+}
+
+export function ChapterEditorPage({
+  chapter,
+  editionId,
+  editionFormat,
+  prevChapter,
+  nextChapter,
+}: {
+  chapter: Chapter
+  editionId: string
+  editionFormat: EditionFormat
+  prevChapter: ChapterNavTarget | null
+  nextChapter: ChapterNavTarget | null
+}) {
+  const router = useRouter()
+  const isAudioEditor = audioFormats.has(editionFormat)
+  const isComic = editionFormat === 'comic'
+  const [mediaSaveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const [chapterTitle, setChapterTitle] = useState(chapter.title)
+  const [editorialNotes, setEditorialNotes] = useState<ChapterEditorialNote[]>([])
+  const [isHtmlMode, setIsHtmlMode] = useState(false)
+  const [htmlContent, setHtmlContent] = useState('')
+  const [initialContent, setInitialContent] = useState(chapter.content)
+  const editorRef = useRef<HTMLDivElement | null>(null)
+  // Отдельный state для DOM-узла редактора — нужен, чтобы передать его как
+  // пропс в EditorialNotesOverlay без чтения ref.current во время render.
+  const [editorContainer, setEditorContainer] = useState<HTMLDivElement | null>(null)
+  const editorCallbackRef = useCallback((node: HTMLDivElement | null) => {
+    editorRef.current = node
+    setEditorContainer(node)
+  }, [])
+  const tiptapRef = useRef<Editor | null>(null)
+  const [, setContentVersion] = useState(0)
+  const autosave = useAutosave({
+    storageKey: `cf-chapter-draft:${chapter.id}`,
+    initial: { title: chapter.title, content: chapter.content ?? '' },
+    save: async (draft) => { await updateChapterAction(chapter.id, draft) },
+    onRestore: (draft) => {
+      setChapterTitle(draft.title)
+      setInitialContent(draft.content)
+      tiptapRef.current?.commands.setContent(draft.content, { emitUpdate: false })
+    },
+  })
+  const saveStatus = isAudioEditor || isComic ? mediaSaveStatus : autosave.status
+  const updateDraft = autosave.update
+  const handleDraftChange = useCallback((patch: { title?: string; content?: string }) => {
+    if (patch.title !== undefined) setChapterTitle(patch.title)
+    updateDraft(patch)
+  }, [updateDraft])
+
+  const handleEditorReady = useCallback((editor: Editor) => {
+    tiptapRef.current = editor
+  }, [])
+
+  const handleNoteFocus = useCallback((note: ChapterEditorialNote) => {
+    const container = editorRef.current
+    if (!container || !note.text_content) return
+
+    const proseMirror = container.querySelector('.ProseMirror')
+    if (!proseMirror) return
+
+    const paragraphs = collectParagraphs(proseMirror)
+
+    let target: HTMLElement | null = null
+
+    for (const p of paragraphs) {
+      const text = p.textContent ?? ''
+      if (text.includes(note.text_content)) {
+        target = p
+        break
+      }
+    }
+
+    if (!target && note.context_before) {
+      for (const p of paragraphs) {
+        const text = p.textContent ?? ''
+        if (text.includes(note.context_before)) {
+          target = p
+          break
+        }
+      }
+    }
+
+    if (!target && note.paragraph_index != null) {
+      target = paragraphs[note.paragraph_index]
+    }
+
+    if (!target) return
+
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+
+    const statusColor = editorialStatusStyle(note.status).color
+    target.style.transition = 'background-color 0.3s ease-out'
+    target.style.backgroundColor = `color-mix(in srgb, ${statusColor} 20%, transparent)`
+    setTimeout(() => {
+      target.style.backgroundColor = `color-mix(in srgb, ${statusColor} 9%, transparent)`
+      setTimeout(() => {
+        target.style.backgroundColor = ''
+      }, 1500)
+    }, 1500)
+  }, [])
+
+  const handleContentUpdate = useCallback(() => {
+    setContentVersion(v => v + 1)
+  }, [])
+
+  async function switchToHtml() {
+    if (!tiptapRef.current) return
+    try {
+      await autosave.flush()
+      setHtmlContent(tiptapRef.current.getHTML())
+      setIsHtmlMode(true)
+    } catch (error) {
+      unstable_rethrow(error)
+      toast.error('Не удалось сохранить правки')
+    }
+  }
+
+  async function switchToWysiwyg() {
+    try {
+      await autosave.flush()
+      setInitialContent(htmlContent)
+      setIsHtmlMode(false)
+    } catch (error) {
+      unstable_rethrow(error)
+      toast.error('Не удалось сохранить правки')
+    }
+  }
+
+  async function handleHtmlSave() {
+    try {
+      await autosave.flush()
+      setInitialContent(htmlContent)
+    } catch (error) {
+      unstable_rethrow(error)
+      toast.error('Не удалось сохранить правки')
+    }
+  }
+
+  async function handlePublish() {
+    try {
+      await autosave.flush()
+      await publishChapterAction(chapter.id)
+      toast.success('Глава опубликована')
+      router.refresh()
+    } catch (error) {
+      unstable_rethrow(error)
+      toast.error('Ошибка публикации')
+    }
+  }
+
+  async function handleDelete() {
+    try {
+      await autosave.flush()
+      await deleteChapterAction(chapter.id)
+    } catch (error) {
+      unstable_rethrow(error)
+      toast.error('Ошибка удаления')
+    }
+  }
+
+  return (
+    <div className="min-h-screen">
+      <header className="sticky top-0 z-40 border-b border-cf-text-1/10 bg-cf-bg/80 backdrop-blur-xl">
+        <div className="mx-auto flex max-w-4xl items-center gap-3 px-4 md:px-8 py-3">
+          <Link href={`/studio/editions/${editionId}`}>
+            <Button variant="ghost" size="icon-sm" className="rounded-xl text-cf-text-3 hover:text-cf-accent hover:bg-cf-accent/10">
+              <ArrowLeft className="h-4 w-4" />
+            </Button>
+          </Link>
+
+          <div className="flex flex-1 items-center gap-2">
+            <Badge variant="outline" className={`border px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] rounded-lg ${chapter.status === 'published' ? 'bg-cf-status-resolved/15 text-cf-status-resolved border-cf-status-resolved/40' : 'bg-cf-status-open/15 text-cf-status-open border-cf-status-open/40'}`}>
+              {chapter.status === 'published' ? 'Опубликована' : 'Черновик'}
+            </Badge>
+            <span className="text-sm text-cf-text-3" role="status" aria-live="polite">
+              {saveStatus === 'pending' && 'Есть несохранённые правки'}
+              {saveStatus === 'saving' && <Loader2 className="inline h-3 w-3 animate-spin text-cf-accent" />}
+              {saveStatus === 'saved' && <Check className="inline h-3 w-3 text-cf-status-resolved" />}
+              {saveStatus === 'error' && <AlertCircle className="inline h-3 w-3 text-cf-accent" />}
+              {saveStatus === 'saving' && ' Сохраняю...'}
+              {saveStatus === 'saved' && ' Сохранено'}
+              {saveStatus === 'error' && ' Ошибка'}
+            </span>
+          </div>
+
+          {(prevChapter || nextChapter) && (
+            <div className="flex items-center gap-1">
+              <ChapterNavButton target={prevChapter} editionId={editionId} label="Предыдущая глава">
+                <ChevronLeft className="h-4 w-4" />
+              </ChapterNavButton>
+              <ChapterNavButton target={nextChapter} editionId={editionId} label="Следующая глава">
+                <ChevronRight className="h-4 w-4" />
+              </ChapterNavButton>
+            </div>
+          )}
+
+          {!isAudioEditor && !isComic && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={isHtmlMode ? switchToWysiwyg : switchToHtml}
+              className={`rounded-xl ${isHtmlMode ? 'bg-cf-status-open/15 text-cf-status-open border border-cf-status-open/40 font-semibold' : 'text-cf-text-3 hover:text-cf-accent hover:bg-cf-accent/10'}`}
+            >
+              <Code2 className="mr-1.5 h-4 w-4" />
+              {isHtmlMode ? 'WYSIWYG' : 'HTML'}
+            </Button>
+          )}
+
+          {!isAudioEditor && !isComic && <VersionHistory chapterId={chapter.id} />}
+
+          {chapter.status !== 'published' && (
+            <Button size="sm" onClick={handlePublish} className="rounded-xl bg-cf-status-resolved text-cf-bg hover:opacity-90">
+              <Globe className="mr-2 h-4 w-4" />
+              Опубликовать
+            </Button>
+          )}
+
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button variant="ghost" size="icon-sm" className="rounded-xl text-cf-text-4 hover:text-cf-accent hover:bg-cf-accent/10">
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent className="bg-cf-bg-2 border-cf-text-1/10 rounded-2xl shadow-xl">
+              <AlertDialogHeader>
+                <AlertDialogTitle className="text-cf-text-heading">Удалить главу?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  Глава и все её версии будут удалены. Это необратимо.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel className="rounded-xl">Отмена</AlertDialogCancel>
+                <AlertDialogAction onClick={handleDelete} className="rounded-xl bg-cf-accent text-cf-bg hover:bg-cf-accent-hover">Удалить</AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        </div>
+      </header>
+
+      <div className="mx-auto max-w-6xl px-4 md:px-8 py-8">
+        {isAudioEditor ? (
+          <div className="mx-auto max-w-4xl">
+            <AudioChapterEditor chapter={chapter} onSaveStatus={setSaveStatus} />
+          </div>
+        ) : isComic ? (
+          <div className="mx-auto max-w-4xl">
+            <div className="bg-cf-bg-2 border border-cf-text-1/10 rounded-2xl p-5 md:p-6">
+              <ComicPagesEditor
+                chapterId={chapter.id}
+                initialPages={parseComicPages(chapter.content)}
+              />
+            </div>
+          </div>
+        ) : isHtmlMode ? (
+          <div className="grid gap-8 lg:grid-cols-[1fr_320px]">
+            <div className="space-y-4">
+              <div className="bg-cf-bg-2 border border-cf-text-1/10 rounded-2xl p-4">
+                <label className="text-sm font-semibold text-cf-text-2 mb-2 block">HTML код главы</label>
+                <textarea
+                  value={htmlContent}
+                  onChange={(e) => {
+                    setHtmlContent(e.target.value)
+                    handleDraftChange({ content: e.target.value })
+                  }}
+                  className="w-full min-h-[60vh] bg-cf-bg border border-cf-text-1/10 rounded-xl font-mono text-sm leading-6 text-cf-text-1 p-4 resize-y focus:outline-none focus:ring-2 focus:ring-cf-accent/70 focus:border-cf-accent/70"
+                  spellCheck={false}
+                />
+                <div className="flex justify-end gap-3 mt-4">
+                  <Button
+                    variant="outline"
+                    onClick={switchToWysiwyg}
+                    className="rounded-xl border-cf-text-1/10 bg-cf-bg text-cf-text-2 hover:bg-cf-bg-2"
+                  >
+                    Вернуться в редактор
+                  </Button>
+                  <Button
+                    onClick={handleHtmlSave}
+                    disabled={saveStatus === 'saving'}
+                    className="rounded-xl bg-cf-accent text-cf-bg hover:bg-cf-accent-hover"
+                  >
+                    {saveStatus === 'saving' ? 'Сохраняю...' : 'Сохранить'}
+                  </Button>
+                </div>
+              </div>
+            </div>
+            <aside className="lg:sticky lg:top-20 lg:self-start">
+              <div className="bg-cf-bg-2 border border-cf-text-1/10 rounded-2xl p-4">
+                <EditorialNotesPanel
+                  chapterId={chapter.id}
+                  onNoteFocus={handleNoteFocus}
+                  editorialNotes={editorialNotes}
+                  onNotesUpdate={setEditorialNotes}
+                />
+              </div>
+            </aside>
+          </div>
+        ) : (
+          <div className="grid gap-8 lg:grid-cols-[1fr_320px]">
+            <div className="relative">
+              <EditorialNotesOverlay
+                editorContainer={editorContainer}
+                notes={editorialNotes}
+                onIndicatorClick={handleNoteFocus}
+              />
+              <TelegraphEditor
+                ref={editorCallbackRef}
+                initialTitle={chapterTitle}
+                initialContent={initialContent}
+                onDraftChange={handleDraftChange}
+                onContentUpdate={handleContentUpdate}
+                onEditorReady={handleEditorReady}
+              />
+            </div>
+            <aside className="lg:sticky lg:top-20 lg:self-start">
+              <div className="bg-cf-bg-2 border border-cf-text-1/10 rounded-2xl p-4">
+                <EditorialNotesPanel
+                  chapterId={chapter.id}
+                  onNoteFocus={handleNoteFocus}
+                  editorialNotes={editorialNotes}
+                  onNotesUpdate={setEditorialNotes}
+                />
+              </div>
+            </aside>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}

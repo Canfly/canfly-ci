@@ -1,0 +1,1266 @@
+'use client'
+
+import { type ReactNode, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react'
+import Image from 'next/image'
+import Link from 'next/link'
+import { X, AlignJustify, Bookmark, BookmarkPlus, Heart, ChevronLeft, Sun, Moon, Palette, MessageCircle, Check, Trash2, Type } from 'lucide-react'
+import { toast } from 'sonner'
+import { useSpreadPagination } from '@/lib/reader/use-spread-pagination'
+import { lastPageStart, chapterProgress } from '@/lib/reader/pagination'
+import { captureReadingPosition, pageForReadingPosition, type ReadingPosition } from '@/lib/reader/reading-position'
+import { useEditorialNotes } from '@/lib/reader/use-editorial-notes'
+import {
+  findTextRange,
+} from '@/lib/reader/highlights-dom'
+import dynamic from 'next/dynamic'
+import { readerRange, captureReaderSelection } from '@/lib/reader/highlight-anchor'
+import { useHighlightRanges } from '@/lib/reader/use-highlight-ranges'
+import { useChapterHighlights } from '@/lib/reader/use-chapter-highlights'
+import type { TextAnchor } from '@/lib/highlights/types'
+const HighlightArtifact = dynamic(() => import('@/components/highlight-artifact').then(m => m.HighlightArtifact))
+const HighlightWorkshopView = dynamic(() => import('@/components/highlights/workshop').then(m => m.HighlightWorkshopView))
+const HighlightCollectionPanel = dynamic(() => import('@/components/highlights/collection-panel').then(m => m.HighlightCollectionPanel))
+import { useReaderPreferences, READER_THEMES, READER_FONTS } from '@/lib/reader/reader-preferences'
+import type { ReaderThemeId } from '@/lib/reader/reader-preferences'
+import type { Release, Edition, Chapter, ChapterHighlight } from '@/lib/releases-types'
+
+export type ReaderUserRole = 'reader' | 'author' | 'editor' | 'admin'
+
+// ─── Типы ─────────────────────────────────────────────────────────────────────
+
+interface SelectionData {
+  anchor?: TextAnchor
+  text: string
+  rect: DOMRect
+  paragraphIndex: number
+  contextBefore: string
+  contextAfter: string
+  startOffset: number
+  endOffset: number
+}
+
+export interface SpreadReaderProps {
+  release: Release
+  edition: Edition
+  chapters: Chapter[]
+  currentUserId: string | null
+  initialHighlights: ChapterHighlight[]
+  userRole: ReaderUserRole | null
+  userName: string | null
+  previewNotice?: ReactNode
+  canManageNotes?: boolean
+  initialHighlightId?: string
+  initialChapterIndex?: number
+  initialPosition?: ReadingPosition | null
+  initialProgressPercent?: number
+  initialProgressUpdatedAt?: number
+  resumeProgress?: boolean
+}
+
+// ─── Компонент ────────────────────────────────────────────────────────────────
+
+export function SpreadReader({
+  release,
+  edition,
+  chapters,
+  currentUserId,
+  initialHighlights,
+  previewNotice,
+  canManageNotes = false,
+  initialHighlightId,
+  initialChapterIndex = 0,
+  initialPosition = null,
+  initialProgressPercent = 0,
+  initialProgressUpdatedAt = 0,
+  resumeProgress = true,
+}: SpreadReaderProps) {
+  const accent = release.design_config?.accent_color ?? '#d52525'
+  const isEditor = canManageNotes
+
+  const {
+    mounted,
+    theme,
+    font,
+    fontSize,
+    t,
+    fontFamily,
+    applyTheme,
+    applyFont,
+    applyFontSize,
+  } = useReaderPreferences()
+
+  // Максимально допустимый translateX трека — чтобы на последней странице
+  // не торчал обрезок соседней колонки через overflow:hidden.
+  // Ширина кликабельной полосы листания по каждому краю viewport.
+  const [sideGutter, setSideGutter] = useState(28)
+
+  // Навигация по главам
+  const [currentIndex, setCurrentIndex] = useState(initialChapterIndex)
+
+  const currentChapter = chapters[currentIndex]
+
+  // Хайлайты
+  const [highlights, setHighlights] = useState<ChapterHighlight[]>(initialHighlights)
+  const [selection, setSelection] = useState<SelectionData | null>(null)
+  const [activeHighlight, setActiveHighlight] = useState<ChapterHighlight | null>(null)
+  const [artifactOpen, setArtifactOpen] = useState(false)
+  const [artifactRect, setArtifactRect] = useState<DOMRect | null>(null)
+
+  // UI-панели
+  const [showToc, setShowToc] = useState(false)
+  const [showBookmarks, setShowBookmarks] = useState(false)
+  const [showThemes, setShowThemes] = useState(false)
+  const [showFonts, setShowFonts] = useState(false)
+
+  // Навигация к закладке из другой главы
+  // При переходе назад — хотим открыть последнюю страницу главы
+  const [pendingLastPage, setPendingLastPage] = useState(false)
+
+  // Refs
+  const stageRef = useRef<HTMLElement>(null)
+  const viewportRef = useRef<HTMLDivElement>(null)
+  const trackRef = useRef<HTMLDivElement>(null)
+  const contentRef = useRef<HTMLDivElement>(null)
+  const readingAnchor = useRef<{ chapterId: string; position: ReadingPosition } | null>(
+    initialPosition && chapters[initialChapterIndex] ? { chapterId: chapters[initialChapterIndex].id, position: initialPosition } : null,
+  )
+  const resumed = useRef(Boolean(initialHighlightId))
+  const latestProgress = useRef<{ editionId: string; chapterId: string; progressPercent: number; position: ReadingPosition } | null>(null)
+  const floatingMenuRef = useRef<HTMLDivElement>(null)
+
+  // Пагинация книжного разворота (используется для currentPage / pageCount
+  // в эффектах навигации к хайлайтам; CSS-разметка больше не зависит от pageWidth).
+  const pagination = useSpreadPagination(viewportRef, trackRef, fontSize, currentChapter?.id ?? '')
+  const {
+    pageCount,
+    currentPage,
+    isSpread,
+    pageWidth,
+    gutter,
+    setCurrentPage,
+    remeasure,
+  } = pagination
+
+  // Перерегистрируем img.onload при смене главы для remeasure после загрузки картинок
+  useEffect(() => {
+    const content = contentRef.current
+    if (!content) return
+    const imgs = content.querySelectorAll('img')
+    imgs.forEach(img => {
+      if (!img.complete) {
+        img.addEventListener('load', remeasure, { once: true })
+      }
+    })
+  }, [currentChapter?.id, remeasure, mounted])
+
+  // Вычисленные
+  const pagesPerView = isSpread ? 2 : 1
+  const maxPage = lastPageStart(pageCount, isSpread)
+
+  // Пересчёт максимального сдвига трека и ширины полей листания. Двойной
+  // rAF, чтобы колонки гарантированно отрендерились с актуальной геометрией
+  // после remeasure.
+  useEffect(() => {
+    const id = requestAnimationFrame(() => requestAnimationFrame(() => {
+      const track = trackRef.current
+      const vp = viewportRef.current
+      const stage = stageRef.current
+      if (!track || !vp || !stage) return
+      // viewport теперь совпадает со страницей (поля живут на stage), поэтому
+      // clientWidth — чистая ширина страницы.
+      // Полоса листания = поле страницы плюс пустое место от края окна до
+      // stage (окно шире maxWidth). Минимум 28px под палец.
+      const padLeft = parseFloat(getComputedStyle(stage).paddingLeft)
+      const g = Math.max(28, Math.floor(stage.getBoundingClientRect().left + padLeft))
+      setSideGutter(prev => (prev !== g ? g : prev))
+    }))
+    return () => cancelAnimationFrame(id)
+  }, [currentChapter?.id, fontSize, pageCount, pagination.spreadWidth, currentPage, mounted])
+
+  // Хайлайты текущей главы
+  const chapterHighlights = useMemo(
+    () => highlights.filter(h => h.chapter_id === currentChapter?.id),
+    [highlights, currentChapter],
+  )
+
+  const myHighlights = useMemo(
+    () => currentUserId
+      ? highlights
+          .filter(h => h.user_id === currentUserId)
+          .sort((a, b) => (a.paragraph_index ?? 0) - (b.paragraph_index ?? 0))
+      : [],
+    [highlights, currentUserId],
+  )
+
+  // Редакторские правки текущей главы (editor/admin)
+  const {
+    chapterNotes: chapterEditorialNotes,
+    activeNote: activeEditorialNote,
+    setActiveNote: setActiveEditorialNote,
+    createNote: createEditorialNote,
+    updateStatus: updateEditorialNoteStatus,
+    deleteNote: deleteEditorialNote,
+  } = useEditorialNotes({ chapterId: currentChapter?.id, enabled: isEditor })
+
+  // Прогресс
+  const intraChapter = chapterProgress(currentPage, pageCount, isSpread)
+  const progress = Math.round(((currentIndex + intraChapter) / chapters.length) * 100)
+
+  useChapterHighlights(currentChapter?.id, setHighlights)
+  useHighlightRanges(contentRef, chapterHighlights, chapterEditorialNotes, setActiveHighlight, setActiveEditorialNote, mounted)
+
+  // ── Сохранение прогресса ──
+  useLayoutEffect(() => {
+    const root = contentRef.current
+    const track = trackRef.current
+    if (!root || !track || !mounted || !pagination.measured || pagination.chapterKey !== currentChapter?.id) return
+    if (!resumed.current && currentUserId && resumeProgress) {
+      try {
+        const raw = localStorage.getItem(`cf-reading:${currentUserId}:${edition.id}`)
+        const local = raw ? JSON.parse(raw) as {
+          version?: number; chapterId?: string; updatedAt?: number; position?: ReadingPosition;
+        } : null
+        if (local?.version === 1 && local.position && (local.updatedAt ?? 0) > initialProgressUpdatedAt &&
+            Number.isInteger(local.position.paragraphIndex) && local.position.paragraphIndex >= 0 &&
+            Number.isInteger(local.position.offset) && local.position.offset >= 0) {
+          const index = chapters.findIndex(chapter => chapter.id === local.chapterId)
+          if (index >= 0) {
+            readingAnchor.current = { chapterId: chapters[index].id, position: local.position }
+            if (index !== currentIndex) {
+              resumed.current = true
+              // eslint-disable-next-line react-hooks/set-state-in-effect -- restore persisted chapter before painting its text
+              setCurrentIndex(index)
+              return
+            }
+          }
+        }
+      } catch {}
+    }
+    const anchor = readingAnchor.current
+    if (anchor?.chapterId === currentChapter?.id) {
+      setCurrentPage(pageForReadingPosition(root, track, anchor.position, pageWidth + gutter))
+    } else if (!resumed.current && currentIndex === initialChapterIndex && initialProgressPercent > 0) {
+      const fraction = Math.max(0, Math.min(1, initialProgressPercent / 100 * chapters.length - currentIndex))
+      setCurrentPage(Math.round(fraction * (pageCount - 1)))
+    }
+    resumed.current = true
+  }, [currentChapter?.id, pageCount, pageWidth, gutter, isSpread, fontSize, mounted, pagination.measured, pagination.chapterKey, setCurrentPage, currentIndex, initialChapterIndex, initialProgressPercent, initialProgressUpdatedAt, chapters, currentUserId, edition.id, resumeProgress])
+
+  useEffect(() => {
+    if (!currentChapter || !mounted || !pagination.measured || pagination.chapterKey !== currentChapter.id) return
+    let payload: { editionId: string; chapterId: string; progressPercent: number; position: ReadingPosition } | null = null
+    const capturePosition = () => {
+      const root = contentRef.current
+      const track = trackRef.current
+      if (!root || !track) return
+      const position = captureReadingPosition(root, track, currentPage, pageWidth + gutter)
+      readingAnchor.current = { chapterId: currentChapter.id, position }
+      payload = { editionId: edition.id, chapterId: currentChapter.id, progressPercent: progress, position }
+      latestProgress.current = payload
+      if (currentUserId) {
+        try { localStorage.setItem(`cf-reading:${currentUserId}:${edition.id}`, JSON.stringify({ version: 1, ...payload, updatedAt: Date.now() })) } catch {}
+      }
+    }
+    let capture = requestAnimationFrame(() => {
+      capture = requestAnimationFrame(capturePosition)
+    })
+    const save = () => {
+      if (!currentUserId || !payload) return
+      fetch('/api/reading-progress', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        keepalive: true,
+      }).catch(() => {})
+    }
+    const timer = setTimeout(save, 1500)
+    return () => {
+      cancelAnimationFrame(capture)
+      clearTimeout(timer)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- saves on chapter+progress change, not on full object
+  }, [currentUserId, currentChapter?.id, edition.id, progress, currentPage, pageWidth, gutter, mounted, pagination.measured, pagination.chapterKey])
+
+  useEffect(() => {
+    if (!currentUserId) return
+    const saveLatest = () => {
+      if (!latestProgress.current) return
+      void fetch('/api/reading-progress', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(latestProgress.current), keepalive: true,
+      }).catch(() => {})
+    }
+    const onHide = () => { if (document.visibilityState === 'hidden') saveLatest() }
+    document.addEventListener('visibilitychange', onHide)
+    return () => {
+      document.removeEventListener('visibilitychange', onHide)
+      saveLatest()
+    }
+  }, [currentUserId, edition.id])
+
+  // ── Сброс страницы и selection при смене главы ──
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset selection/artifact on chapter change
+    setSelection(null)
+     
+    setArtifactOpen(false)
+  }, [currentIndex])
+
+  // ── После remeasure: восстановить последнюю страницу (переход назад) ──
+  useEffect(() => {
+    if (!pendingLastPage || !pagination.measured || pagination.chapterKey !== currentChapter?.id) return
+    const lastPage = lastPageStart(pageCount, isSpread)
+    setCurrentPage(Math.max(0, lastPage))
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- restore last page on back navigation
+    setPendingLastPage(false)
+  }, [pendingLastPage, pageCount, isSpread, setCurrentPage, pagination.measured, pagination.chapterKey, currentChapter?.id])
+
+  const openedHighlight = useRef(false)
+  useEffect(() => {
+    const root = contentRef.current
+    const track = trackRef.current
+    const target = chapterHighlights.find(item => item.id === initialHighlightId)
+    if (openedHighlight.current || !target || !root || !track || !pagination.measured) return
+    const range = readerRange(root, target.anchor ?? {
+      exact: target.text_content, prefix: '', suffix: '', start: -1, end: -1,
+    })
+    openedHighlight.current = true
+    const rect = range?.getClientRects()[0]
+    if (!rect) return
+    const step = pageWidth + gutter
+    const page = Math.max(0, Math.floor((rect.left - track.getBoundingClientRect().left) / step))
+    setCurrentPage(isSpread ? page - page % 2 : page)
+  }, [chapterHighlights, initialHighlightId, pagination.measured, pageWidth, gutter, isSpread, setCurrentPage])
+
+  // ── Навигация ──
+  const goNext = useCallback(() => {
+    const next = currentPage + pagesPerView
+    if (next <= maxPage) {
+      setCurrentPage(next)
+    } else if (currentIndex < chapters.length - 1) {
+      setCurrentIndex(i => i + 1)
+      setCurrentPage(0)
+    }
+  }, [currentPage, pagesPerView, maxPage, currentIndex, chapters.length, setCurrentPage])
+
+  const goPrev = useCallback(() => {
+    const prev = currentPage - pagesPerView
+    if (prev >= 0) {
+      setCurrentPage(prev)
+    } else if (currentIndex > 0) {
+      setCurrentIndex(i => i - 1)
+      setPendingLastPage(true)
+      setCurrentPage(0)
+    }
+  }, [currentPage, pagesPerView, currentIndex, setCurrentPage])
+
+  // ── Клавиатура ──
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
+      if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); goNext() }
+      if (e.key === 'ArrowLeft') { e.preventDefault(); goPrev() }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [goNext, goPrev])
+
+  // ── Тап и свайп на mobile ──
+  // Один обработчик на «стол»: тап по боковой четверти листает, свайп листает
+  // с любой точки страницы. Текст остаётся зоной выделения — центральные 44%
+  // на тап не реагируют, а активное выделение и цитаты отменяют жест целиком.
+  useEffect(() => {
+    const stage = stageRef.current
+    if (!stage) return
+    let startX = 0
+    let startY = 0
+    let startedAt = 0
+    const onTouchStart = (e: TouchEvent) => {
+      startX = e.touches[0].clientX
+      startY = e.touches[0].clientY
+      startedAt = performance.now()
+    }
+    const onTouchEnd = (e: TouchEvent) => {
+      // Выделение (или тап по нему) не должно листать: pointerup уже отдал
+      // фрагмент в пилюлю, а страница ушла бы из-под него.
+      const sel = window.getSelection()
+      if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) return
+      // Тап по цитате открывает попап — это делает слушатель на contentRef.
+      if (e.target instanceof HTMLElement && e.target.closest('mark[data-cf-hl], mark[data-cf-en]')) return
+
+      const touch = e.changedTouches[0]
+      const dx = touch.clientX - startX
+      const dy = touch.clientY - startY
+      const elapsed = performance.now() - startedAt
+
+      if (Math.abs(dx) < 10 && Math.abs(dy) < 10) {
+        const rect = stage.getBoundingClientRect()
+        const ratio = (touch.clientX - rect.left) / rect.width
+        if (ratio < 0.28) goPrev()
+        else if (ratio > 0.72) goNext()
+        return
+      }
+
+      if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5 && elapsed < 600) {
+        if (dx < 0) goNext()
+        else goPrev()
+      }
+    }
+    stage.addEventListener('touchstart', onTouchStart, { passive: true })
+    stage.addEventListener('touchend', onTouchEnd, { passive: true })
+    return () => {
+      stage.removeEventListener('touchstart', onTouchStart)
+      stage.removeEventListener('touchend', onTouchEnd)
+    }
+    // mounted в deps: до гидрации разметки со «столом» ещё нет, и без него
+    // подписка не встала бы после появления узла.
+  }, [goNext, goPrev, mounted])
+
+  // ── Выделение текста → хайлайт ──
+  const handleMouseUp = useCallback(async () => {
+    if (!currentUserId || !contentRef.current || artifactOpen) return
+    const captured = await captureReaderSelection(contentRef.current)
+    setSelection(captured)
+  }, [currentUserId, artifactOpen])
+
+  // Mobile WebKit фиксирует финальный Range после pointerup, поэтому читаем
+  // Selection в следующей задаче очереди.
+  const handleSelectionEnd = useCallback(() => {
+    window.setTimeout(handleMouseUp, 0)
+  }, [handleMouseUp])
+
+  const toggleLike = async (id: string) => {
+    if (!currentUserId) { toast.error('Войдите чтобы ставить лайки'); return }
+    const target = highlights.find(h => h.id === id)
+    if (!target) return
+    const res = await fetch(`/api/chapter-highlights/${id}/like`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ liked: !target.is_liked_by_me }),
+    })
+    if (res.ok) {
+      const data = await res.json()
+      setHighlights(prev => prev.map(h =>
+        h.id === id ? { ...h, is_liked_by_me: data.data.liked, likes_count: data.data.likes_count } : h,
+      ))
+      if (activeHighlight?.id === id) {
+        setActiveHighlight(prev => prev ? { ...prev, is_liked_by_me: data.data.liked, likes_count: data.data.likes_count } : null)
+      }
+    } else {
+      toast.error('Не удалось обновить лайк')
+    }
+  }
+
+  // ── Пустое состояние ──
+  if (chapters.length === 0) {
+    return (
+      <div className="fixed inset-0 flex items-center justify-center" style={{ backgroundColor: t.bg }}>
+        <p className="text-sm" style={{ color: t.text2 }}>Содержимое ещё не опубликовано</p>
+      </div>
+    )
+  }
+
+  // useSyncExternalStore отдаёт одинаковый default-снепшот на сервере и при
+  // первом клиентском рендере — hydration mismatch не возникает.
+  if (!mounted) {
+    return (
+      <div
+        className="fixed inset-0"
+        style={{ backgroundColor: READER_THEMES.void.bg }}
+        aria-hidden
+      />
+    )
+  }
+
+  return (
+    <div
+      className="fixed inset-0"
+      style={{ backgroundColor: t.bg, color: t.text, fontFamily, transition: 'background-color 0.4s, color 0.4s' }}
+    >
+      <div
+        className="reader-container"
+        style={{
+          display: 'grid',
+          gridTemplateRows: previewNotice ? 'auto 50px minmax(0, 1fr) 40px' : '50px minmax(0, 1fr) 40px',
+          // minmax(0, 1fr), а не неявная auto-колонка: без явной колонки её
+          // ширину браузер считает по max-content детей (grid blowout) — на
+          // узких экранах нерезолвимый maxWidth: '40%' у .book-title откатывался
+          // к полной ширине заголовка, и вся сетка вылезала за экран.
+          gridTemplateColumns: 'minmax(0, 1fr)',
+          // dvh, а не vh: в мобильном Safari 100vh выше видимой области, и
+          // футер с низом страницы уезжали под адресную строку.
+          height: '100dvh',
+          boxSizing: 'border-box',
+          backgroundColor: t.bg,
+          color: t.text,
+          fontFamily,
+          transition: 'background-color 0.4s, color 0.4s',
+        }}
+      >
+        {previewNotice}
+        <header
+          className="reader-header px-2 sm:px-4"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            fontSize: 13,
+            color: t.text2,
+            fontFamily: 'var(--font-geist-sans)',
+            position: 'relative',
+            // Grid-item по умолчанию не сжимается уже своего min-content —
+            // без этого truncate у .book-title не мог схлопнуться до maxWidth.
+            minWidth: 0,
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Link
+              href={`/release/${release.slug}`}
+              title="О произведении"
+              aria-label={`О произведении «${release.title}»`}
+              // Паддинг адаптивный, классом: на телефоне тач-зона 24px (padding:4)
+              // слишком мала для пальца, на десктопе — норм для курсора.
+              className="gap-1 whitespace-nowrap p-2.5 text-[11px] sm:p-1 sm:text-xs"
+              style={{ color: t.text2, display: 'inline-flex', alignItems: 'center' }}
+            >
+              <ChevronLeft className="h-4 w-4" />
+              <span>О произведении</span>
+            </Link>
+          </div>
+
+          <span
+            className="book-title truncate"
+            style={{ maxWidth: '40%' }}
+            title={`${release.title} — ${currentChapter?.title ?? ''}`}
+          >
+            <Link
+              href={`/release/${release.slug}`}
+              title="О произведении"
+              className="hover:underline"
+              style={{ color: 'inherit', opacity: 0.7 }}
+            >
+              {release.title}
+            </Link>
+            {chapters.length > 1 && (
+              <span style={{ opacity: 0.5 }}> · {currentChapter?.title}</span>
+            )}
+          </span>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, position: 'relative' }}>
+            {chapters.length > 1 && (
+              <button
+                type="button"
+                onClick={() => setShowToc(true)}
+                title="Оглавление"
+                className="p-2.5 sm:p-1"
+                style={{ color: t.text }}
+              >
+                <AlignJustify className="h-4 w-4" />
+              </button>
+            )}
+            {currentUserId && (
+              <button
+                type="button"
+                onClick={() => setShowBookmarks(b => !b)}
+                title="Закладки"
+                className="p-2.5 sm:p-1"
+                style={{ color: showBookmarks ? accent : t.text }}
+              >
+                <Bookmark
+                  className="h-4 w-4"
+                  style={{ fill: myHighlights.length > 0 ? 'currentColor' : 'none' }}
+                />
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => { setShowFonts(b => !b); setShowThemes(false) }}
+              title={`Шрифт и размер: ${READER_FONTS.find(f => f.id === font)?.label ?? 'Cormorant'} · ${fontSize}px`}
+              className="p-2.5 sm:p-1"
+              style={{ color: showFonts ? accent : t.text }}
+            >
+              <Type className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => { setShowThemes(b => !b); setShowFonts(false) }}
+              title={`Тема: ${READER_THEMES[theme].label}`}
+              className="p-2.5 sm:p-1"
+              style={{ color: showThemes ? accent : t.text }}
+            >
+              {theme === 'void' ? <Moon className="h-4 w-4" /> : theme === 'manuscript' ? <Sun className="h-4 w-4" /> : <Palette className="h-4 w-4" />}
+            </button>
+
+            {showThemes && (
+              <div
+                style={{
+                  position: 'absolute',
+                  right: 0,
+                  top: 'calc(100% + 6px)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 4,
+                  padding: 8,
+                  backgroundColor: t.bg,
+                  border: `1px solid ${t.text}20`,
+                  borderRadius: 4,
+                  zIndex: 60,
+                  minWidth: 160,
+                }}
+              >
+                {(['void', 'manuscript', 'sepia'] as ReaderThemeId[]).map(th => {
+                  const def = READER_THEMES[th]
+                  const active = theme === th
+                  return (
+                    <button
+                      key={th}
+                      type="button"
+                      onClick={() => { applyTheme(th); setShowThemes(false) }}
+                      title={def.fullName}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        padding: '6px 8px',
+                        fontSize: 11,
+                        fontWeight: 800,
+                        letterSpacing: '0.16em',
+                        textTransform: 'uppercase',
+                        color: active ? accent : t.text2,
+                        border: `1px solid ${active ? accent : 'transparent'}`,
+                        background: 'transparent',
+                      }}
+                    >
+                      <span
+                        style={{
+                          width: 16,
+                          height: 12,
+                          backgroundColor: def.bg2,
+                          border: `1px solid ${t.text}40`,
+                        }}
+                      />
+                      {def.label}
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+
+            {showFonts && (
+              <div
+                style={{
+                  position: 'absolute',
+                  right: 0,
+                  top: 'calc(100% + 6px)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 8,
+                  padding: 8,
+                  backgroundColor: t.bg,
+                  border: `1px solid ${t.text}20`,
+                  borderRadius: 4,
+                  zIndex: 60,
+                  minWidth: 220,
+                }}
+              >
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: 8,
+                    padding: '6px 8px',
+                  }}
+                >
+                  <span
+                    style={{
+                      fontSize: 10,
+                      fontWeight: 800,
+                      letterSpacing: '0.16em',
+                      textTransform: 'uppercase',
+                      color: t.text2,
+                      fontFamily: 'var(--font-geist-sans)',
+                    }}
+                  >
+                    Размер
+                  </span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <button
+                      type="button"
+                      onClick={() => applyFontSize(Math.max(14, fontSize - 2))}
+                      title="Мельче"
+                      style={{
+                        color: t.text,
+                        padding: '2px 8px',
+                        fontSize: 11,
+                        fontWeight: 800,
+                        border: `1px solid ${t.text}25`,
+                        borderRadius: 3,
+                        background: 'transparent',
+                      }}
+                    >A−</button>
+                    <span
+                      style={{
+                        fontSize: 11,
+                        color: t.text2,
+                        fontFamily: 'var(--font-geist-sans)',
+                        minWidth: 24,
+                        textAlign: 'center',
+                        fontVariantNumeric: 'tabular-nums',
+                      }}
+                    >
+                      {fontSize}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => applyFontSize(Math.min(26, fontSize + 2))}
+                      title="Крупнее"
+                      style={{
+                        color: t.text,
+                        padding: '2px 8px',
+                        fontSize: 13,
+                        fontWeight: 800,
+                        border: `1px solid ${t.text}25`,
+                        borderRadius: 3,
+                        background: 'transparent',
+                      }}
+                    >A+</button>
+                  </div>
+                </div>
+
+                <div style={{ height: 1, backgroundColor: `${t.text}12` }} />
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  {READER_FONTS.map(fn => {
+                    const active = font === fn.id
+                    return (
+                      <button
+                        key={fn.id}
+                        type="button"
+                        onClick={() => { applyFont(fn.id); setShowFonts(false) }}
+                        style={{
+                          display: 'flex',
+                          flexDirection: 'column',
+                          alignItems: 'flex-start',
+                          gap: 2,
+                          padding: '8px 10px',
+                          textAlign: 'left',
+                          background: 'transparent',
+                          borderLeft: `2px solid ${active ? accent : 'transparent'}`,
+                        }}
+                      >
+                        <span
+                          style={{
+                            fontSize: 10,
+                            fontWeight: 800,
+                            letterSpacing: '0.16em',
+                            textTransform: 'uppercase',
+                            color: active ? accent : t.text2,
+                            fontFamily: 'var(--font-geist-sans)',
+                          }}
+                        >
+                          {fn.label}
+                        </span>
+                        <span style={{ fontSize: 13, color: t.text, fontFamily: fn.family }}>
+                          {fn.sample}
+                        </span>
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        </header>
+
+        {/* «Стол»: поля книги живут здесь, а не в padding viewport — иначе
+            overflow:hidden режет по padding-box, и в поле проглядывает край
+            соседней страницы. Классы, не inline: inline перебил бы sm:. */}
+        <main
+          ref={stageRef}
+          className="book-stage px-[22px] py-4 sm:px-10 sm:py-5"
+          style={{
+            width: '100%',
+            maxWidth: 1200,
+            margin: '0 auto',
+            boxSizing: 'border-box',
+            overflow: 'hidden',
+            minHeight: 0,
+          }}
+        >
+          <div
+            ref={viewportRef}
+            className="book-viewport relative"
+            style={{ width: '100%', height: '100%', overflow: 'hidden' }}
+          >
+            <div
+              ref={trackRef}
+              className="book-columns"
+              style={{
+                height: '100%',
+                width: pagination.spreadWidth,
+                columnCount: isSpread ? 2 : 1,
+                // Шаг листания хук считает как pageWidth + gutter, поэтому
+                // зазор между колонками обязан быть тем же gutter.
+                columnGap: gutter,
+                columnFill: 'auto',
+                fontSize: `${fontSize}px`,
+                lineHeight: 1.7,
+                textAlign: 'justify',
+                textJustify: 'inter-word',
+                hyphens: 'auto',
+                WebkitHyphens: 'auto',
+                MozHyphens: 'auto',
+                msHyphens: 'auto',
+                transform: `translateX(-${currentPage * (pagination.pageWidth + pagination.gutter)}px)`,
+              }}
+            >
+              {chapters.length > 1 && (
+                <p
+                  style={{
+                    columnSpan: 'all',
+                    fontSize: '11px',
+                    fontFamily: 'var(--font-geist-sans)',
+                    letterSpacing: '0.18em',
+                    textTransform: 'uppercase',
+                    margin: '0 0 8px',
+                    color: accent,
+                    breakAfter: 'avoid',
+                  }}
+                >
+                  {currentIndex === 0 && release.genre ? release.genre : ''}
+                </p>
+              )}
+              <h1
+                style={{
+                  columnSpan: 'all',
+                  fontFamily: 'var(--font-geist-sans)',
+                  fontSize: '1.6em',
+                  fontWeight: 800,
+                  textTransform: 'uppercase',
+                  lineHeight: 1.1,
+                  margin: '0 0 24px',
+                  breakAfter: 'avoid',
+                  textAlign: 'left',
+                }}
+              >
+                {currentChapter?.title}
+              </h1>
+
+              {currentChapter?.content ? (
+                <div
+                  ref={contentRef}
+                  onPointerUp={handleSelectionEnd}
+                  lang="ru"
+                  className="prose max-w-none cf-reader-content"
+                  style={{
+                    fontSize: `${fontSize}px`,
+                    lineHeight: 1.7,
+                    color: t.text,
+                    fontFamily,
+                    hyphens: 'auto',
+                    WebkitHyphens: 'auto',
+                    MozHyphens: 'auto',
+                    msHyphens: 'auto',
+                    ['--tw-prose-body' as string]: t.text,
+                    ['--tw-prose-headings' as string]: t.text,
+                    ['--tw-prose-links' as string]: accent,
+                    ['--tw-prose-bold' as string]: t.text,
+                    ['--tw-prose-quotes' as string]: t.text,
+                    ['--tw-prose-hr' as string]: `${t.text}20`,
+                  }}
+                  dangerouslySetInnerHTML={{ __html: currentChapter.content ?? '' }}
+                />
+              ) : (
+                <p style={{ textAlign: 'center', opacity: 0.4 }}>Содержимое главы ещё не добавлено</p>
+              )}
+            </div>
+          </div>
+        </main>
+
+        <footer
+          className="reader-footer px-[22px] sm:px-10"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            fontSize: 12,
+            color: t.text2,
+            fontFamily: 'var(--font-geist-sans)',
+            minWidth: 0,
+          }}
+        >
+          <span style={{ opacity: 0.6 }}>
+            {currentIndex === 0 && release.authors.length > 0
+              ? release.authors.map(a => a.name).join(', ')
+              : ''}
+          </span>
+          <span style={{ opacity: 0.55, display: 'flex', gap: 12 }}>
+            {chapters.length > 1 && (
+              <span>{`Глава ${currentIndex + 1} / ${chapters.length}`}</span>
+            )}
+            {/* Без номера страницы на телефоне не видно, что тап сработал. */}
+            <span style={{ fontVariantNumeric: 'tabular-nums' }}>
+              {pagesPerView > 1 && Math.min(currentPage + 2, pageCount) > currentPage + 1
+                ? `${currentPage + 1}–${Math.min(currentPage + 2, pageCount)} / ${pageCount}`
+                : `${currentPage + 1} / ${pageCount}`}
+            </span>
+          </span>
+        </footer>
+      </div>
+
+      {/* Полоски листания в полях — для курсора. На телефоне не нужны:
+          там листает тап по боковой четверти страницы и свайп. */}
+      <button
+        type="button"
+        aria-label="Предыдущая страница"
+        onClick={goPrev}
+        className="max-sm:hidden"
+        style={{
+          position: 'absolute',
+          top: 70,
+          bottom: 60,
+          left: 0,
+          width: `${sideGutter}px`,
+          background: 'transparent',
+          border: 0,
+          cursor: 'pointer',
+          zIndex: 2,
+          padding: 0,
+        }}
+      />
+      <button
+        type="button"
+        aria-label="Следующая страница"
+        onClick={goNext}
+        className="max-sm:hidden"
+        style={{
+          position: 'absolute',
+          top: 70,
+          bottom: 60,
+          right: 0,
+          width: `${sideGutter}px`,
+          background: 'transparent',
+          border: 0,
+          cursor: 'pointer',
+          zIndex: 2,
+          padding: 0,
+        }}
+      />
+
+      <style>{`
+        .cf-reader-content p {
+          margin: 0;
+          text-indent: 1.5em;
+        }
+        .cf-reader-content p:first-child {
+          text-indent: 0;
+        }
+      `}</style>
+
+      {/* ── Floating selection pill ── */}
+      {selection && !artifactOpen && (
+        <div
+          ref={floatingMenuRef}
+          className="fixed z-[100] flex items-center overflow-hidden shadow-2xl max-sm:inset-x-4 max-sm:bottom-4 max-sm:justify-between max-sm:rounded-lg sm:rounded-full sm:top-[var(--selection-top)] sm:left-[var(--selection-left)]"
+          style={{
+            '--selection-top': `${Math.max(60, selection.rect.top - 52)}px`,
+            '--selection-left': `${Math.max(8, Math.min(window.innerWidth - 220, selection.rect.left + selection.rect.width / 2 - 104))}px`,
+            backgroundColor: '#0e0d0c',
+            border: '1px solid rgba(244,239,229,0.12)',
+          } as React.CSSProperties}
+          onMouseDown={e => e.preventDefault()}
+        >
+          <span
+            className="max-w-[42vw] truncate pl-4 pr-2 text-[12px] italic opacity-50 select-none sm:max-w-[180px]"
+            style={{ fontFamily: 'var(--font-cormorant)', color: '#f4efe5' }}
+          >
+            {selection.text.length > 28 ? selection.text.slice(0, 28) + '…' : selection.text}
+          </span>
+          <span className="h-5 w-px" style={{ backgroundColor: 'rgba(244,239,229,0.12)' }} />
+          <button
+            onClick={() => { setArtifactRect(selection.rect); setArtifactOpen(true) }}
+            className="flex items-center gap-1.5 px-3.5 py-2.5 text-[10px] font-black uppercase tracking-[0.14em] transition-colors hover:bg-white/5"
+            style={{ color: accent }}
+          >
+            <BookmarkPlus className="h-3.5 w-3.5" />
+            <span>С фрагментом</span>
+          </button>
+          <span className="h-5 w-px" style={{ backgroundColor: 'rgba(244,239,229,0.12)' }} />
+          <button
+            onClick={() => { setSelection(null); window.getSelection()?.removeAllRanges() }}
+            className="flex items-center justify-center px-3 py-2.5 opacity-40 transition-opacity hover:opacity-80"
+            style={{ color: '#f4efe5' }}
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
+
+      {/* ── Артефакт ── */}
+      {selection && currentChapter && (
+        <HighlightArtifact
+          key={selection.anchor ? selection.anchor.revision + selection.anchor.start : selection.text}
+          open={artifactOpen}
+          text={selection.text}
+          chapterTitle={currentChapter.title}
+          anchorRect={artifactRect}
+          releaseSlug={release.slug}
+          chapterId={currentChapter.id}
+          paragraphIndex={selection.paragraphIndex}
+          contextBefore={selection.contextBefore}
+          contextAfter={selection.contextAfter}
+          anchor={selection.anchor}
+          startOffset={selection.startOffset}
+          endOffset={selection.endOffset}
+          currentUserId={currentUserId}
+          onSaved={hl => {
+            setHighlights(prev => [hl, ...prev.filter(h => h.id !== hl.id)])
+            window.getSelection()?.removeAllRanges()
+          }}
+          onClose={() => {
+            setArtifactOpen(false)
+            setSelection(null)
+            window.getSelection()?.removeAllRanges()
+          }}
+          accent={accent}
+          bg={t.bg2}
+          textColor={t.text}
+          isEditor={isEditor}
+          onSaveEditorial={async noteText => {
+            if (!selection) return
+            const ok = await createEditorialNote(selection, noteText)
+            if (!ok) throw new Error('Не удалось сохранить замечание')
+            if (ok) {
+              setArtifactOpen(false)
+              setSelection(null)
+              window.getSelection()?.removeAllRanges()
+            }
+          }}
+        />
+      )}
+
+      {/* ── Попап редакторской правки ── */}
+      {activeEditorialNote && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          onClick={() => setActiveEditorialNote(null)}
+        >
+          <div className="absolute inset-0 bg-black/40" />
+          <div
+            className="relative w-full max-w-md border p-6 shadow-2xl"
+            style={{ backgroundColor: t.bg2, borderColor: '#e9731640', color: t.text }}
+            onClick={e => e.stopPropagation()}
+          >
+            <button
+              onClick={() => setActiveEditorialNote(null)}
+              className="absolute right-3 top-3 p-1 opacity-40 hover:opacity-100"
+              aria-label="Закрыть"
+            >
+              <X className="h-4 w-4" />
+            </button>
+
+            <div className="mb-3 flex items-center gap-2">
+              <MessageCircle className="h-4 w-4" style={{ color: '#e97316' }} />
+              <span className="text-[10px] font-black uppercase tracking-[0.16em]" style={{ color: '#e97316' }}>
+                {activeEditorialNote.status === 'open' ? 'Открытое замечание'
+                  : activeEditorialNote.status === 'resolved' ? 'Решённое замечание'
+                  : 'Проигнорированное замечание'}
+              </span>
+            </div>
+
+            <div className="mb-4 flex items-center gap-3">
+              {activeEditorialNote.author_avatar ? (
+                <div className="relative h-10 w-10">
+                  <Image src={activeEditorialNote.author_avatar} alt={activeEditorialNote.author_name ?? ''} fill sizes="40px" className="rounded-full object-cover" />
+                </div>
+              ) : (
+                <div className="flex h-10 w-10 items-center justify-center rounded-full" style={{ backgroundColor: '#e9731633', color: '#e97316' }}>
+                  <span className="text-sm font-black">{(activeEditorialNote.author_name ?? '?')[0]}</span>
+                </div>
+              )}
+              <div>
+                <p className="text-sm font-bold">{activeEditorialNote.author_name ?? 'Редактор'}</p>
+                <p className="text-[10px] opacity-50">
+                  {new Date(activeEditorialNote.created_at).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' })}
+                </p>
+              </div>
+            </div>
+
+            <blockquote
+              className="border-l-2 pl-3 text-sm italic leading-relaxed opacity-80"
+              style={{ borderColor: '#e97316' }}
+            >
+              «{activeEditorialNote.text_content}»
+            </blockquote>
+
+            <p className="mt-4 text-sm leading-relaxed">{activeEditorialNote.note}</p>
+
+            {isEditor && (
+              <div className="mt-5 flex gap-2">
+                {activeEditorialNote.status === 'open' ? (
+                  <>
+                    <button
+                      onClick={() => updateEditorialNoteStatus(activeEditorialNote.id, 'resolved')}
+                      className="flex h-8 flex-1 items-center justify-center gap-1.5 text-xs font-black uppercase tracking-[0.1em]"
+                      style={{ backgroundColor: '#16a34a', color: t.bg }}
+                    >
+                      <Check className="h-3 w-3" /> Решено
+                    </button>
+                    <button
+                      onClick={() => updateEditorialNoteStatus(activeEditorialNote.id, 'ignored')}
+                      className="h-8 flex-1 border text-xs transition-opacity hover:opacity-60"
+                      style={{ borderColor: `${t.text}20` }}
+                    >
+                      Игнорировать
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    onClick={() => updateEditorialNoteStatus(activeEditorialNote.id, 'open')}
+                    className="h-8 flex-1 border text-xs transition-opacity hover:opacity-60"
+                    style={{ borderColor: `${t.text}20` }}
+                  >
+                    Вернуть в работу
+                  </button>
+                )}
+                <button
+                  onClick={() => {
+                    if (!confirm('Удалить замечание?')) return
+                    deleteEditorialNote(activeEditorialNote.id)
+                  }}
+                  className="flex h-8 w-8 shrink-0 items-center justify-center border transition-opacity hover:opacity-60"
+                  style={{ borderColor: `${t.text}20` }}
+                  aria-label="Удалить замечание"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── Попап хайлайта ── */}
+      {activeHighlight && activeHighlight.user_id === currentUserId && <HighlightWorkshopView id={activeHighlight.id} onClose={() => setActiveHighlight(null)} />}
+      {activeHighlight && activeHighlight.user_id !== currentUserId && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          onClick={() => setActiveHighlight(null)}
+        >
+          <div className="absolute inset-0 bg-black/40" />
+          <div
+            className="relative w-full max-w-md border p-6 shadow-2xl"
+            style={{ backgroundColor: t.bg2, borderColor: `${t.text}18`, color: t.text }}
+            onClick={e => e.stopPropagation()}
+          >
+            <button onClick={() => setActiveHighlight(null)} className="absolute right-3 top-3 p-1 opacity-40 hover:opacity-100">
+              <X className="h-4 w-4" />
+            </button>
+            <div className="mb-4 flex items-center gap-3">
+              {activeHighlight.user_avatar ? (
+                <div className="relative h-10 w-10">
+                  <Image src={activeHighlight.user_avatar} alt={activeHighlight.user_name ?? ''} fill sizes="40px" className="rounded-full object-cover" />
+                </div>
+              ) : (
+                <div className="flex h-10 w-10 items-center justify-center rounded-full" style={{ backgroundColor: `${accent}33`, color: accent }}>
+                  <span className="text-sm font-black">{(activeHighlight.user_name ?? '?')[0]}</span>
+                </div>
+              )}
+              <div>
+                <p className="text-sm font-bold">{activeHighlight.user_name ?? 'Аноним'}</p>
+                <p className="text-[10px] opacity-50">
+                  {new Date(activeHighlight.created_at).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' })}
+                </p>
+              </div>
+            </div>
+            <blockquote
+              className="border-l-2 pl-3 text-sm italic leading-relaxed opacity-80"
+              style={{ borderColor: accent, fontFamily: 'var(--font-cormorant)', fontSize: '16px' }}
+            >
+              «{activeHighlight.text_content}»
+            </blockquote>
+            {activeHighlight.note && (
+              <p className="mt-4 text-sm leading-relaxed">{activeHighlight.note}</p>
+            )}
+            <div className="mt-5 flex items-center justify-between">
+              <button
+                onClick={() => toggleLike(activeHighlight.id)}
+                className="flex items-center gap-1.5 text-xs opacity-70 transition-opacity hover:opacity-100"
+              >
+                <Heart className="h-3.5 w-3.5" style={activeHighlight.is_liked_by_me ? { fill: accent, color: accent } : undefined} />
+                <span>{activeHighlight.likes_count}</span>
+              </button>
+              <Link
+                href={`/release/${release.slug}/highlight/${activeHighlight.id}`}
+                className="text-[10px] uppercase tracking-[0.16em] opacity-50 hover:opacity-100"
+                style={{ color: accent }}
+              >
+                Поделиться
+              </Link>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Оглавление ── */}
+      {showToc && (
+        <div className="fixed inset-0 z-50 flex">
+          <div className="flex-1 bg-black/40" onClick={() => setShowToc(false)} />
+          <aside
+            className="flex w-72 flex-col border-l"
+            style={{ backgroundColor: t.bg2, borderColor: `${t.text}12` }}
+          >
+            <div className="flex items-center justify-between border-b px-4 py-4" style={{ borderColor: `${t.text}12` }}>
+              <h2 className="text-sm font-black uppercase tracking-[0.14em]" style={{ color: t.text }}>Оглавление</h2>
+              <button onClick={() => setShowToc(false)} className="p-1 opacity-40 hover:opacity-100" style={{ color: t.text }}>
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto">
+              {chapters.map((ch, i) => (
+                <button
+                  key={ch.id}
+                  onClick={() => { setCurrentIndex(i); setCurrentPage(0); setShowToc(false) }}
+                  className="flex w-full items-start gap-3 border-b px-4 py-3 text-left transition-colors"
+                  style={{
+                    borderColor: `${t.text}08`,
+                    backgroundColor: i === currentIndex ? `${accent}10` : 'transparent',
+                  }}
+                >
+                  <span
+                    className="mt-0.5 min-w-[20px] text-xs font-black tabular-nums"
+                    style={{ color: i === currentIndex ? accent : `${t.text}40` }}
+                  >
+                    {String(i + 1).padStart(2, '0')}
+                  </span>
+                  <div>
+                    <p
+                      className="text-sm leading-snug"
+                      style={{ color: i === currentIndex ? t.text : `${t.text}70`, fontWeight: i === currentIndex ? 700 : 400 }}
+                    >
+                      {ch.title}
+                    </p>
+                    {ch.word_count > 0 && (
+                      <p className="mt-0.5 text-[10px] opacity-30" style={{ color: t.text }}>
+                        {ch.word_count.toLocaleString('ru-RU')} слов
+                      </p>
+                    )}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </aside>
+        </div>
+      )}
+
+      {/* ── Закладки ── */}
+      {currentUserId && showBookmarks && <HighlightCollectionPanel editionId={edition.id} onClose={() => setShowBookmarks(false)} />}
+    </div>
+  )
+}
+
+// ─── Вспомогательные компоненты ───────────────────────────────────────────────
+
+// findTextRange переэкспортируем так чтобы не импортировать highlights-dom в тесте напрямую
+export { findTextRange }

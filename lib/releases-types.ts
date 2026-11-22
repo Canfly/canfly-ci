@@ -1,0 +1,379 @@
+import type { ReleaseBlock, ReleaseHeroArtMode } from '@/lib/release-design'
+
+export type ReleaseStatus = 'draft' | 'published' | 'archived'
+export type EditionStatus = 'draft' | 'published' | 'archived'
+export type EditionFormat = 'book' | 'comic' | 'audiobook' | 'audiorelease' | 'album' | 'magazine' | 'digital' | 'artwork'
+export type QualityTier = 'draft' | 'standard' | 'premium'
+export type MediaType = 'trailer' | 'podcast' | 'review' | 'other'
+export type CollaboratorRole = 'owner' | 'editor' | 'viewer'
+export type ChapterStatus = 'draft' | 'published'
+export type ReleaseCharacterRole = 'main' | 'supporting' | 'cameo'
+
+/** Фильтр персонажа по роли в релизе. 'all' — любая роль (главные/второстепенные/камео вместе). */
+export type CharacterListRole = ReleaseCharacterRole | 'all'
+export type CommentStatus = 'pending' | 'approved' | 'spam'
+export type HeroStyle = 'full' | 'centered' | 'minimal'
+export type HeroOverlay = 'dark' | 'gradient' | 'none'
+export type ReleaseLayout = 'wide' | 'narrow' | 'sidebar'
+
+export interface ReleaseDesignConfig {
+  block_order?: ReleaseBlock[]
+  hidden_blocks?: ReleaseBlock[]
+  cover_fit?: 'cover' | 'contain'
+  accent_color?: string
+  bg_color?: string
+  text_color?: string
+  hero_style?: HeroStyle
+  hero_overlay?: HeroOverlay
+  hero_art?: ReleaseHeroArtMode
+  layout?: ReleaseLayout
+  show_toc?: boolean
+  show_characters?: boolean
+  show_series?: boolean
+}
+
+export interface ReleaseAuthor {
+  name: string
+  role: string
+}
+
+export interface Release {
+  id: string
+  title: string
+  slug: string
+  description: string | null
+  cover_image: string | null
+  genre: string | null
+  release_date: string | null
+  isbn: string | null
+  authors: ReleaseAuthor[]
+  annotation: string | null
+  editor_notes: string | null
+  view_count: number
+  status: ReleaseStatus
+  /**
+   * Показывать ли релиз на странице каталога /releases. Инвариант единственный:
+   * фильтрует fetchReleasesPage (lib/server/releases.ts). Остальные листинги
+   * (поиск, sitemap, события главной, серии, персонажи) флаг игнорируют,
+   * прямая ссылка /release/[slug] работает как у обычного published-релиза.
+   */
+  show_in_catalog: boolean
+  design_config: ReleaseDesignConfig
+  created_at: string
+  updated_at: string
+}
+
+export interface Series {
+  id: string
+  title: string
+  slug: string
+  description: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface Edition {
+  id: string
+  release_id: string
+  format: EditionFormat
+  artwork_url: string | null
+  platform: string | null
+  external_url: string | null
+  slug: string
+  status: EditionStatus
+  is_primary: boolean
+  quality_tier: QualityTier
+  created_at: string
+  updated_at: string
+}
+
+/**
+ * Вход createEdition. Слаг не передаётся из форм: он собирается на сервере из
+ * слага релиза, поле оставлено для импорта и миграций данных.
+ */
+export interface EditionCreateInput {
+  release_id: string
+  format?: EditionFormat
+  artwork_url?: string | null
+  platform?: string | null
+  external_url?: string | null
+  slug?: string
+  status?: EditionStatus
+  is_primary?: boolean
+  quality_tier?: QualityTier
+}
+
+/**
+ * Вход updateEdition: в UPDATE попадают только переданные ключи. Отсутствие
+ * ключа — «не трогать», поэтому Partial здесь означает именно частичный апдейт.
+ */
+export type EditionUpdateInput = Partial<Omit<EditionCreateInput, 'release_id'>>
+
+/** Издание вместе с релизом-владельцем — для сквозных списков в Studio. */
+export type EditionWithRelease = Edition & {
+  release_title: string
+  release_slug: string
+  release_status: ReleaseStatus
+  chapter_count: number
+}
+
+export interface Chapter {
+  id: string
+  edition_id: string
+  title: string
+  content: string | null
+  audio_url: string | null
+  audio_blob_path: string | null
+  duration_seconds: number | null
+  audio_metadata: Record<string, unknown>
+  audio_content_type: string | null
+  audio_file_size_bytes: number | null
+  audio_uploaded_at: string | null
+  chapter_index: number
+  status: ChapterStatus
+  word_count: number
+  view_count: number
+  created_at: string
+  updated_at: string
+  published_at: string | null
+}
+
+export interface LyricLine {
+  text: string
+  time?: number
+}
+
+export interface ChapterLyrics {
+  format: 'synced' | 'plain'
+  lines: LyricLine[]
+}
+
+export function extractLyrics(metadata: Record<string, unknown>): ChapterLyrics | null {
+  const raw = metadata.lyrics
+  if (!raw || typeof raw !== 'object') return null
+  const obj = raw as Record<string, unknown>
+  if (obj.format !== 'synced' && obj.format !== 'plain') return null
+  if (!Array.isArray(obj.lines)) return null
+  const lines: LyricLine[] = []
+  for (const line of obj.lines) {
+    if (!line || typeof line !== 'object') continue
+    const l = line as Record<string, unknown>
+    if (typeof l.text !== 'string' || !l.text) continue
+    lines.push({ text: l.text, time: typeof l.time === 'number' && l.time >= 0 ? l.time : undefined })
+  }
+  if (lines.length === 0) return null
+  return { format: obj.format as 'synced' | 'plain', lines }
+}
+
+export interface ReleaseSeries {
+  release_id: string
+  series_id: string
+  phase_number: number | null
+}
+
+export interface ReleaseCharacter {
+  release_id: string
+  character_id: string
+  role: ReleaseCharacterRole
+}
+
+export interface Comment {
+  id: string
+  release_id: string
+  user_id: string
+  content: string
+  status: CommentStatus
+  created_at: string
+}
+
+export interface ReleaseMedia {
+  id: string
+  release_id: string
+  type: MediaType
+  title: string
+  url: string
+  description: string | null
+  created_at: string
+}
+
+export interface ReadingProgress {
+  id: string
+  edition_id: string
+  chapter_id: string
+  user_id: string | null
+  session_id: string | null
+  progress_percent: number
+  last_read_at: string
+}
+
+export interface ReleaseCollaborator {
+  release_id: string
+  user_id: string
+  role: CollaboratorRole
+}
+
+export interface Bookmark {
+  id: string
+  chapter_id: string
+  user_id: string
+  note: string | null
+  created_at: string
+}
+
+export interface ChapterVersion {
+  id: string
+  chapter_id: string
+  content: string
+  version_number: number
+  created_at: string
+}
+
+// === Release Events (HomeIssuesSection) ===
+
+export type ReleaseEventType = 'new_edition' | 'new_chapter'
+
+export interface ReleaseEvent {
+  event_type: ReleaseEventType
+  release_id: string
+  release_title: string
+  release_slug: string
+  cover_image: string | null
+  edition_id: string
+  edition_slug: string
+  format: EditionFormat
+  quality_tier: QualityTier | null
+  chapter_title: string | null
+  chapter_index: number | null
+  new_chapters_count: number
+  new_editions_count: number
+  event_at: string
+}
+
+// === Chapter Highlights ===
+
+/** Результат одного AI-инструмента над цитатой — хранится в `chapter_highlights.ai_artifacts`. */
+export interface HighlightAiArtifact {
+  content?: string
+  image_url?: string
+  prompt?: string
+  updated_at: string
+}
+
+export type HighlightRewriteMode = 'другой-финал' | 'другая-эпоха' | 'другой-стиль'
+
+export interface HighlightAiArtifacts {
+  explain?: HighlightAiArtifact
+  meaning?: HighlightAiArtifact
+  illustrate?: HighlightAiArtifact
+  rewrite?: Partial<Record<HighlightRewriteMode, HighlightAiArtifact>>
+}
+
+export interface ChapterHighlight {
+  edition_slug?: string
+  anchor?: import("@/lib/highlights/types").TextAnchor | null
+  publication?: import("@/lib/highlights/types").HighlightPublication | null
+  id: string
+  chapter_id: string
+  user_id: string
+  text_content: string
+  paragraph_index: number | null
+  context_before: string | null
+  context_after: string | null
+  client_request_id?: string | null
+  start_offset?: number | null
+  end_offset?: number | null
+  source_chapter_updated_at?: string | null
+  note: string | null
+  is_public: boolean
+  likes_count: number
+  created_at: string
+  updated_at?: string
+  ai_artifacts?: HighlightAiArtifacts
+  // Joins
+  user_name?: string | null
+  user_avatar?: string | null
+  is_liked_by_me?: boolean
+  release_slug?: string
+  chapter_title?: string
+}
+
+export interface ChapterHighlightInput {
+  anchor?: import("@/lib/highlights/types").TextAnchor | null
+  chapter_id: string
+  text_content: string
+  paragraph_index?: number | null
+  context_before?: string | null
+  context_after?: string | null
+  client_request_id?: string
+  start_offset?: number | null
+  end_offset?: number | null
+  note?: string | null
+  is_public: boolean
+}
+
+// === Editorial Notes (только для Studio) ===
+
+export type EditorialNoteStatus = 'open' | 'resolved' | 'ignored'
+
+export interface ChapterEditorialNote {
+  id: string
+  chapter_id: string
+  author_id: string
+  text_content: string
+  paragraph_index: number | null
+  context_before: string | null
+  context_after: string | null
+  client_request_id?: string | null
+  start_offset?: number | null
+  end_offset?: number | null
+  source_chapter_updated_at?: string | null
+  note: string
+  status: EditorialNoteStatus
+  created_at: string
+  resolved_at: string | null
+  updated_at?: string
+  // Joins
+  author_name?: string | null
+  author_avatar?: string | null
+}
+
+// === Games ===
+
+/** Соотношение сторон окна игры на странице-обёртке. */
+export type GameAspectRatio = '16:9' | '4:3' | '1:1' | '9:16'
+
+/**
+ * Игра — статический бандл в `public/games/<slug>/` (точка входа `game.html`).
+ * В БД живут только метаданные и связи, сами файлы в canfly не собираются.
+ */
+export interface Game {
+  id: string
+  title: string
+  slug: string
+  tagline: string | null
+  description: string | null
+  cover_image: string | null
+  seo_title: string | null
+  seo_description: string | null
+  seo_noindex: boolean
+  aspect_ratio: GameAspectRatio
+  display_order: number
+  is_published: boolean
+  created_at: string
+  updated_at: string
+}
+
+/** Связь игры с релизом — для блока «Игры» на странице релиза. */
+export interface ReleaseGame {
+  release_id: string
+  release_slug: string
+  release_title: string
+}
+
+/** Связь игры с персонажем — для чипов на странице игры. */
+export interface CharacterGame {
+  character_id: string
+  character_name: string
+  character_slug: string
+  character_avatar: string | null
+}

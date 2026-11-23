@@ -39,12 +39,10 @@ jobs:
     name: DB (${{ matrix.database }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         database: [canfly_e2e_ci_a, canfly_e2e_ci_b]
-    services:
-      postgres:
-        image: postgres:17.12-bookworm
-        env:
+    env:
           POSTGRES_PASSWORD: local-admin
         ports:
           - 5432/tcp
@@ -68,10 +66,21 @@ jobs:
           node-version: 24
       - run: npm install --global pnpm@12.21.0
       - run: pnpm install --frozen-lockfile
+      - name: Start isolated PostgreSQL 17 on loopback
+        run: |
+          docker run --detach --name canfly-postgres --network host \
+            --env POSTGRES_PASSWORD=local-admin --env PGPORT=55432 \
+            postgres:17.12-bookworm -c listen_addresses=127.0.0.1 -p 55432
+          for attempt in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 55432 -U postgres; then exit 0; fi
+            sleep 1
+          done
+          docker logs canfly-postgres
+          exit 1
       - name: Create database and local roles
         env:
           PGPASSWORD: local-admin
-          TEST_PG_PORT: ${{ job.services.postgres.ports[5432] }}
+          TEST_PG_PORT: 55432
         run: |
           psql -X -h 127.0.0.1 -p "$TEST_PG_PORT" -U postgres -d postgres -v ON_ERROR_STOP=1 \
             -v db="$TEST_DATABASE" <<'SQL'
@@ -82,14 +91,14 @@ jobs:
           SQL
       - name: Bootstrap and verify the catalog
         env:
-          CANFLY_E2E_DATABASE_URL: postgresql://canfly_owner:local-owner@127.0.0.1:${{ job.services.postgres.ports[5432] }}/${{ matrix.database }}
+          CANFLY_E2E_DATABASE_URL: postgresql://canfly_owner:local-owner@127.0.0.1:55432/${{ matrix.database }}
         run: |
           pnpm db:bootstrap:test
           pnpm db:verify-schema
       - name: Apply and verify the versioned migration chain
         env:
-          CANFLY_MIGRATION_DATABASE_URL: postgresql://canfly_owner:local-owner@127.0.0.1:${{ job.services.postgres.ports[5432] }}/${{ matrix.database }}
-          TEST_PG_PORT: ${{ job.services.postgres.ports[5432] }}
+          CANFLY_MIGRATION_DATABASE_URL: postgresql://canfly_owner:local-owner@127.0.0.1:55432/${{ matrix.database }}
+          TEST_PG_PORT: 55432
         run: |
           target="127.0.0.1:$TEST_PG_PORT/$TEST_DATABASE"
           pnpm db:migrate:verify
@@ -101,7 +110,7 @@ jobs:
       - name: Grant application access
         env:
           PGPASSWORD: local-owner
-          TEST_PG_PORT: ${{ job.services.postgres.ports[5432] }}
+          TEST_PG_PORT: 55432
         run: |
           psql -X -h 127.0.0.1 -p "$TEST_PG_PORT" -U canfly_owner -d "$TEST_DATABASE" -v ON_ERROR_STOP=1 <<'SQL'
           GRANT USAGE ON SCHEMA public TO canfly_app;
@@ -110,16 +119,16 @@ jobs:
           SQL
       - name: Run repository contracts as the application role
         env:
-          CANFLY_E2E_DATABASE_URL: postgresql://canfly_app:local-app@127.0.0.1:${{ job.services.postgres.ports[5432] }}/${{ matrix.database }}
+          CANFLY_E2E_DATABASE_URL: postgresql://canfly_app:local-app@127.0.0.1:55432/${{ matrix.database }}
           PLAYWRIGHT_JUNIT_OUTPUT_FILE: db-results.xml
         run: pnpm test:db --reporter=list,junit
       - name: Test migration rollback, concurrency and checksums
         if: matrix.database == 'canfly_e2e_ci_a'
         env:
           PGPASSWORD: local-admin
-          TEST_PG_PORT: ${{ job.services.postgres.ports[5432] }}
-          CANFLY_E2E_DATABASE_URL: postgresql://canfly_owner:local-owner@127.0.0.1:${{ job.services.postgres.ports[5432] }}/canfly_e2e_migration_system
-          CANFLY_MIGRATION_TEST_DATABASE_URL: postgresql://canfly_owner:local-owner@127.0.0.1:${{ job.services.postgres.ports[5432] }}/canfly_e2e_migration_system
+          TEST_PG_PORT: 55432
+          CANFLY_E2E_DATABASE_URL: postgresql://canfly_owner:local-owner@127.0.0.1:55432/canfly_e2e_migration_system
+          CANFLY_MIGRATION_TEST_DATABASE_URL: postgresql://canfly_owner:local-owner@127.0.0.1:55432/canfly_e2e_migration_system
         run: |
           psql -X -h 127.0.0.1 -p "$TEST_PG_PORT" -U postgres -d postgres -v ON_ERROR_STOP=1 <<'SQL'
           CREATE DATABASE canfly_e2e_migration_system OWNER canfly_owner TEMPLATE template0
@@ -136,12 +145,10 @@ jobs:
     name: Build and E2E
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         database: [canfly_e2e_ci_browser]
-    services:
-      postgres:
-        image: postgres:17.12-bookworm
-        env:
+    env:
           POSTGRES_PASSWORD: local-admin
         ports:
           - 5432/tcp
@@ -165,10 +172,21 @@ jobs:
           node-version: 24
       - run: npm install --global pnpm@12.21.0
       - run: pnpm install --frozen-lockfile
+      - name: Start isolated PostgreSQL 17 on loopback
+        run: |
+          docker run --detach --name canfly-postgres --network host \
+            --env POSTGRES_PASSWORD=local-admin --env PGPORT=55432 \
+            postgres:17.12-bookworm -c listen_addresses=127.0.0.1 -p 55432
+          for attempt in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 55432 -U postgres; then exit 0; fi
+            sleep 1
+          done
+          docker logs canfly-postgres
+          exit 1
       - name: Create database and local roles
         env:
           PGPASSWORD: local-admin
-          TEST_PG_PORT: ${{ job.services.postgres.ports[5432] }}
+          TEST_PG_PORT: 55432
         run: |
           psql -X -h 127.0.0.1 -p "$TEST_PG_PORT" -U postgres -d postgres -v ON_ERROR_STOP=1 \
             -v db="$TEST_DATABASE" <<'SQL'
@@ -179,14 +197,14 @@ jobs:
           SQL
       - name: Bootstrap and verify the catalog
         env:
-          CANFLY_E2E_DATABASE_URL: postgresql://canfly_owner:local-owner@127.0.0.1:${{ job.services.postgres.ports[5432] }}/${{ matrix.database }}
+          CANFLY_E2E_DATABASE_URL: postgresql://canfly_owner:local-owner@127.0.0.1:55432/${{ matrix.database }}
         run: |
           pnpm db:bootstrap:test
           pnpm db:verify-schema
       - name: Apply and verify the versioned migration chain
         env:
-          CANFLY_MIGRATION_DATABASE_URL: postgresql://canfly_owner:local-owner@127.0.0.1:${{ job.services.postgres.ports[5432] }}/${{ matrix.database }}
-          TEST_PG_PORT: ${{ job.services.postgres.ports[5432] }}
+          CANFLY_MIGRATION_DATABASE_URL: postgresql://canfly_owner:local-owner@127.0.0.1:55432/${{ matrix.database }}
+          TEST_PG_PORT: 55432
         run: |
           target="127.0.0.1:$TEST_PG_PORT/$TEST_DATABASE"
           pnpm db:migrate:verify
@@ -198,7 +216,7 @@ jobs:
       - name: Grant application access
         env:
           PGPASSWORD: local-owner
-          TEST_PG_PORT: ${{ job.services.postgres.ports[5432] }}
+          TEST_PG_PORT: 55432
         run: |
           psql -X -h 127.0.0.1 -p "$TEST_PG_PORT" -U canfly_owner -d "$TEST_DATABASE" -v ON_ERROR_STOP=1 <<'SQL'
           GRANT USAGE ON SCHEMA public TO canfly_app;
@@ -207,7 +225,7 @@ jobs:
           SQL
       - name: Build
         env:
-          DATABASE_URL: postgresql://canfly_app:local-app@127.0.0.1:${{ job.services.postgres.ports[5432] }}/${{ matrix.database }}
+          DATABASE_URL: postgresql://canfly_app:local-app@127.0.0.1:55432/${{ matrix.database }}
           AUTH_SECRET: canfly-isolated-runner-only-no-production-access
           NEXT_PUBLIC_BASE_URL: http://127.0.0.1:3100
         run: bash -o pipefail -c 'pnpm build 2>&1 | tee build.log'
@@ -215,7 +233,7 @@ jobs:
         run: pnpm exec playwright install --with-deps chromium
       - name: Run E2E
         env:
-          CANFLY_E2E_DATABASE_URL: postgresql://canfly_app:local-app@127.0.0.1:${{ job.services.postgres.ports[5432] }}/${{ matrix.database }}
+          CANFLY_E2E_DATABASE_URL: postgresql://canfly_app:local-app@127.0.0.1:55432/${{ matrix.database }}
           AUTH_SECRET: canfly-isolated-runner-only-no-production-access
           AUTH_TRUST_HOST: 'true'
           NEXT_PUBLIC_BASE_URL: http://127.0.0.1:3100

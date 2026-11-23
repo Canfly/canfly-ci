@@ -219,8 +219,10 @@ jobs:
           AUTH_SECRET: canfly-isolated-runner-only-no-production-access
           AUTH_TRUST_HOST: 'true'
           NEXT_PUBLIC_BASE_URL: http://127.0.0.1:3100
+          CI: ''
+          PLAYWRIGHT_HTML_OPEN: never
           PLAYWRIGHT_JUNIT_OUTPUT_FILE: e2e-results.xml
-        run: pnpm test:e2e --reporter=list,junit,html
+        run: pnpm test:e2e --workers=2 --retries=1 --reporter=list,junit,html
       - uses: actions/upload-artifact@v4
         if: always()
         with:

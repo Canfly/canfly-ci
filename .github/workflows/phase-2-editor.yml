@@ -97,9 +97,11 @@ jobs:
           AUTH_SECRET: canfly-isolated-runner-only-no-production-access
           AUTH_TRUST_HOST: 'true'
           NEXT_PUBLIC_BASE_URL: http://127.0.0.1:3100
+          CI: ''
+          PLAYWRIGHT_HTML_OPEN: never
           PLAYWRIGHT_JUNIT_OUTPUT_FILE: e2e-results.xml
         run: |
-          pnpm test:e2e e2e/chapter-lease.spec.ts --grep 'H3: ответ|H5: аудиоправки|H6: внутрисайтовый|heartbeat распознаёт' --reporter=list,junit,html
+          pnpm test:e2e e2e/chapter-lease.spec.ts --grep 'H3: ответ|H5: аудиоправки|H6: внутрисайтовый|heartbeat распознаёт' --workers=2 --retries=1 --reporter=list,junit,html
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -1,0 +1,110 @@
+name: Phase 2 editor regressions
+run-name: Editor regressions · 8c4ab44
+on:
+  push:
+    branches: [ci/phase-2-8c4ab44]
+    paths: ['.github/workflows/phase-2-editor.yml']
+permissions:
+  contents: read
+env:
+  CANFLY_SOURCE_SHA: 8c4ab448fe57e63164b9fae20004481bcaa1cb6f
+  NEXT_TELEMETRY_DISABLED: '1'
+jobs:
+  browser:
+    name: Build and E2E
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        database: [canfly_e2e_ci_browser]
+    env:
+      TEST_DATABASE: ${{ matrix.database }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: adiom/canfly
+          ref: 8c4ab448fe57e63164b9fae20004481bcaa1cb6f
+          persist-credentials: false
+      - name: Verify source SHA
+        run: test "$(git rev-parse HEAD)" = "${{ env.CANFLY_SOURCE_SHA }}"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install --global pnpm@12.21.0
+      - run: pnpm install --frozen-lockfile
+      - name: Start isolated PostgreSQL 17 on loopback
+        run: |
+          docker run --detach --name canfly-postgres --network host \
+            --env POSTGRES_PASSWORD=local-admin --env PGPORT=55432 \
+            postgres:17.12-bookworm -c listen_addresses=127.0.0.1 -p 55432
+          for attempt in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 55432 -U postgres; then exit 0; fi
+            sleep 1
+          done
+          docker logs canfly-postgres
+          exit 1
+      - name: Create database and local roles
+        env:
+          PGPASSWORD: local-admin
+          TEST_PG_PORT: 55432
+        run: |
+          psql -X -h 127.0.0.1 -p "$TEST_PG_PORT" -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -v db="$TEST_DATABASE" <<'SQL'
+          CREATE ROLE canfly_owner LOGIN PASSWORD 'local-owner';
+          CREATE ROLE canfly_app LOGIN PASSWORD 'local-app';
+          CREATE DATABASE :"db" OWNER canfly_owner TEMPLATE template0
+            ENCODING 'UTF8' LOCALE_PROVIDER builtin LOCALE 'C.UTF-8';
+          SQL
+      - name: Bootstrap and verify the catalog
+        env:
+          CANFLY_E2E_DATABASE_URL: postgresql://canfly_owner:local-owner@127.0.0.1:55432/${{ matrix.database }}
+        run: |
+          pnpm db:bootstrap:test
+          pnpm db:verify-schema
+      - name: Apply and verify the versioned migration chain
+        env:
+          CANFLY_MIGRATION_DATABASE_URL: postgresql://canfly_owner:local-owner@127.0.0.1:55432/${{ matrix.database }}
+          TEST_PG_PORT: 55432
+        run: |
+          target="127.0.0.1:$TEST_PG_PORT/$TEST_DATABASE"
+          pnpm db:migrate:verify
+          pnpm db:migrate:baseline --confirm="$target"
+          pnpm db:migrate:up --confirm="$target"
+          pnpm db:migrate:up --confirm="$target"
+          pnpm db:migrate:verify
+          pnpm db:migrate:status
+      - name: Grant application access
+        env:
+          PGPASSWORD: local-owner
+          TEST_PG_PORT: 55432
+        run: |
+          psql -X -h 127.0.0.1 -p "$TEST_PG_PORT" -U canfly_owner -d "$TEST_DATABASE" -v ON_ERROR_STOP=1 <<'SQL'
+          GRANT USAGE ON SCHEMA public TO canfly_app;
+          GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO canfly_app;
+          GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO canfly_app;
+          SQL
+      - name: Build
+        env:
+          DATABASE_URL: postgresql://canfly_app:local-app@127.0.0.1:55432/${{ matrix.database }}
+          AUTH_SECRET: canfly-isolated-runner-only-no-production-access
+          NEXT_PUBLIC_BASE_URL: http://127.0.0.1:3100
+        run: bash -o pipefail -c 'pnpm build 2>&1 | tee build.log'
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Run E2E
+        env:
+          CANFLY_E2E_DATABASE_URL: postgresql://canfly_app:local-app@127.0.0.1:55432/${{ matrix.database }}
+          AUTH_SECRET: canfly-isolated-runner-only-no-production-access
+          AUTH_TRUST_HOST: 'true'
+          NEXT_PUBLIC_BASE_URL: http://127.0.0.1:3100
+          PLAYWRIGHT_JUNIT_OUTPUT_FILE: e2e-results.xml
+        run: pnpm test:e2e e2e/chapter-lease.spec.ts --grep 'H3: ответ|H5: аудиоправки|H6: внутрисайтовый|heartbeat распознаёт' --reporter=list,junit,html
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: editor-regression-results
+          path: |
+            build.log
+            e2e-results.xml
+            playwright-report/
+            test-results/

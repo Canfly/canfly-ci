@@ -43,15 +43,6 @@ jobs:
       matrix:
         database: [canfly_e2e_ci_a, canfly_e2e_ci_b]
     env:
-          POSTGRES_PASSWORD: local-admin
-        ports:
-          - 5432/tcp
-        options: >-
-          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-    env:
       TEST_DATABASE: ${{ matrix.database }}
     steps:
       - uses: actions/checkout@v4
@@ -148,15 +139,6 @@ jobs:
       fail-fast: false
       matrix:
         database: [canfly_e2e_ci_browser]
-    env:
-          POSTGRES_PASSWORD: local-admin
-        ports:
-          - 5432/tcp
-        options: >-
-          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
     env:
       TEST_DATABASE: ${{ matrix.database }}
     steps:

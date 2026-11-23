@@ -1,5 +1,5 @@
 name: Canfly Playwright validation
-run-name: Canfly PR 79 · f569bbc
+run-name: Canfly PR 79 · 53da221
 
 on:
   push:
@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: adiom/canfly
-          ref: f569bbc94ecf84b47e9b940553f28efcb972f2d2
+          ref: 53da221116f616df56867f4c2cf1b69d5ae21f40
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
@@ -45,7 +45,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: adiom/canfly
-          ref: f569bbc94ecf84b47e9b940553f28efcb972f2d2
+          ref: 53da221116f616df56867f4c2cf1b69d5ae21f40
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
